@@ -1,0 +1,1420 @@
+Directory structure:
+└── ncahill89-eiv_igp/
+    ├── README.md
+    ├── EIVIGP.Rproj
+    ├── RunIGP.R
+    ├── .Rapp.history
+    ├── model/
+    │   ├── EIVIGP.txt
+    │   ├── EIVIGP_estquad.txt
+    │   └── EIVIGPfast.txt
+    └── R/
+        ├── diagnostics.R
+        ├── f_data.R
+        ├── F_IGPresults.R
+        ├── F_output.R
+        ├── F_rsldiff.R
+        ├── F_runIGP.R
+        ├── Get_diagnostics.R
+        ├── readMCMC.R
+        └── .Rapp.history
+
+================================================
+FILE: README.md
+================================================
+# EIV_IGP
+
+
+__About the Model__
+
+The Errors in Variables Integrated Gaussian Process (EIV IGP) Model is used to perform Bayesian inference on historical rates of sea-level change. 
+
+The input data to the model can be from tidegauge measurements and/or proxy reconstructions from cores of coastal sediment. These data are complicated by multiple sources of uncertainty, some of which arise as part of the data collection exercise. Notably, the proxy reconstructions include temporal uncertainty from dating of the sediment core using techniques such as radiocarbon. The EIV IGP model places a Gaussian process prior on the rate of sea-level change, which is then integrated to provide the mean of the likelihood for the observed data. The model is set in an errors-in-variables framework to take account of age uncertainty. The resulting model captures the continuous and dynamic evolution of sea-level change with full consideration of all available sources of uncertainty. For a more detailed model description check out the paper which you will find [here](https://www.jstor.org/stable/24522592?seq=4#metadata_info_tab_contents).
+
+__Running the code__
+
+Dowload the repo and click the `EIVIGP.Rproj` to open the project in Rstudio. Then you need to open the `runIGP.R` script to run the model. Example datasets are provided. 
+
+__JAGS (Just Another Gibbs Sampler)__
+
+Running these models requires JAGS (Just Another Gibbs Sampler) which you can install from [here](https://sourceforge.net/projects/mcmc-jags/).
+
+
+
+================================================
+FILE: EIVIGP.Rproj
+================================================
+Version: 1.0
+
+RestoreWorkspace: Default
+SaveWorkspace: Default
+AlwaysSaveHistory: Default
+
+EnableCodeIndexing: Yes
+UseSpacesForTab: Yes
+NumSpacesForTab: 2
+Encoding: UTF-8
+
+RnwWeave: Sweave
+LaTeX: pdfLaTeX
+
+
+
+================================================
+FILE: RunIGP.R
+================================================
+###Clear workspace###
+rm (list = ls( )) 
+
+### Required Packages and Libraries ###
+## uncomment the install.packages if these packages aren't already installed ###
+#install.packages(c("rjags","R2jags","fields","tidyverse))
+library(rjags)
+library(R2jags)
+library(fields)
+library(tidyverse)
+##############################################################
+
+### Load the required R functions ###
+Rfiles <- list.files(file.path(getwd(), "R"))
+Rfiles <- Rfiles[grepl(".R", Rfiles)]
+sapply(paste0("R/", Rfiles), source)
+
+### An example of the correct format for the data is shown for New Jersey
+## Do not change the headings (RSL,RSLError,Age,AgeError)
+## Errors must be 1-sigma
+## If Age is given in the BP scale, change the BP_age_scale argument to TRUE in the dataprep() function below
+
+### Prepare the data for the model ###
+## User to input the data file location and the name of their dataset e.g., dataname = "New York"
+## Plot of the raw data will be saved to fig folder
+data.raw <- dataprep(data_path = "data/NYC.csv",
+                   dataname = "New York, USA",
+                   BP_age_scale = FALSE)
+
+## NOTE!!! If correcting for GIA change GIA = TRUE and provide a rate of GIA in mm/yr
+
+### Run the model ###
+## User to provide the interval for how often they want predictions from the model
+interval = 30
+
+## run
+RunIGPModel(data.raw=data.raw,
+            interval = interval,
+            fast = FALSE)
+
+## Check convergence for GP parameters
+## Note: this won't work if fast = TRUE
+get_diagnostics(data.raw=data.raw)
+
+### Output the model figures and results ###
+## Figures will output to fig folder
+## .csv file will output to results folder
+IGPResults(data.raw = data.raw,
+           interval = interval)
+
+
+
+
+================================================
+FILE: .Rapp.history
+================================================
+
+
+
+================================================
+FILE: model/EIVIGP.txt
+================================================
+model
+{
+  for(i in 1:n)
+  {
+  D[i,] ~ dmnorm(mu[i,],P[,,i])
+  mu[i,1] ~ dnorm(0,1.0E-3)
+  mu[i,2] ~ dnorm(mu.y[i],tau.y)
+  mu.y[i]<-beta0+w.tilde.m[i]
+  } 
+  
+  ###Derivative process 
+  w.m~dmnorm(mu.w,K.inv)
+  K.inv <- inverse((1/tau.g)*K)
+  K.w.inv<-inverse(K)
+  
+  for(i in 1:m)
+  {
+  mu.w[i]<-0
+  K[i,i]<-1+0.00001
+  
+  ######Exponential covariance for the derivative process
+  for(j in (i+1):m)
+  {
+  K[i,j]<-(pow(p,pow(Dist[i,j],kappa)))
+  K[j,i]<-K[i,j]
+  }
+  }
+  
+  ###Expected value of the integrated Gaussian Process
+  for(i in 1:m) { 
+  for(j in 1:n) {
+  K.gw[j,i]<-sum(pow(p,quad1[j,i,])*quad2[j,i,])  #### Quadrature function 
+  } #End j loop 
+  } #End i loop	
+
+
+  
+  w.tilde.m<-K.gw%*%K.w.inv%*%w.m
+  
+# Priors
+beta0 ~ dnorm(0.0,1.0E-6)
+p ~ dunif(0,1)
+tau.y <- pow(sigma.y,-2)
+tau.g ~ dgamma(10,100)
+sigma.y ~ dunif(0.01,1) 
+sigma.g <- pow(tau.g,-0.5)
+
+ 
+}##End model
+
+
+
+================================================
+FILE: model/EIVIGP_estquad.txt
+================================================
+model
+{
+  for(i in 1:n)
+  {
+  D[i,] ~ dmnorm(mu[i,],P[,,i])
+  mu[i,1] ~ dnorm(0,1.0E-3)
+  mu[i,2] ~ dnorm(mu.y[i],tau.y)
+  mu.y[i]<-beta0+w.tilde.m[i]
+  } 
+  
+  ###Derivative process 
+  w.m~dmnorm(mu.w,K.inv)
+  K.inv <- inverse((1/tau.g)*K)
+  K.w.inv<-inverse(K)
+  
+  for(i in 1:m)
+  {
+  mu.w[i]<-0
+  K[i,i]<-1+0.00001
+  
+  ######Exponential covariance for the derivative process
+  for(j in (i+1):m)
+  {
+  K[i,j]<-(pow(p,pow(Dist[i,j],kappa)))
+  K[j,i]<-K[i,j]
+  }
+  }
+  
+
+###Expected value of the integrated Gaussian Process
+for(i in 1:m) { 
+  for(j in 1:n) {
+    for(k in 1:L){
+quad1[j,i,k]<- pow(abs((mu[j,1]*cosfunc[k]/2)+(mu[j,1]/2)-xstar[i]),1.99)
+quad2[j,i,k]<-((mu[j,1]/2)*(ppi/L))*(sqrt(1-pow(cosfunc[k],2)))
+
+}
+K.gw[j,i]<-sum(pow(p,quad1[j,i,])*quad2[j,i,]) #### Quadrature function 
+   
+ } #End j loop 
+
+} #End i loop	
+
+
+  
+  w.tilde.m<-K.gw%*%K.w.inv%*%w.m
+  
+# Priors
+beta0 ~ dnorm(0.0,1.0E-6)
+p ~ dunif(0,1)
+tau.y<-pow(sigma.y,-2)
+tau.g~ dgamma(10,100)
+sigma.y ~ dunif(0.01,1) 
+sigma.g <-pow(tau.g,-0.5)
+
+ 
+}##End model
+
+
+
+================================================
+FILE: model/EIVIGPfast.txt
+================================================
+model
+{
+  for(i in 1:n)
+  {
+  D[i,] ~ dmnorm(mu[i,],P[,,i])
+  mu[i,1] ~ dnorm(0,1.0E-3)
+  mu[i,2] ~ dnorm(mu.y[i],tau.y)
+  mu.y[i]<-beta0+w.tilde.m[i]
+  } 
+  
+  ###Derivative process 
+  w.m~dmnorm(mu.w,K.inv)
+  K.inv <- inverse((1/tau.g)*K)
+  K.w.inv<-inverse(K)
+  
+  for(i in 1:m)
+  {
+  mu.w[i]<-0
+  K[i,i]<-1+0.00001
+  
+  ######Exponential covariance for the derivative process
+  for(j in (i+1):m)
+  {
+  K[i,j]<-(pow(p,pow(Dist[i,j],kappa)))
+  K[j,i]<-K[i,j]
+  }
+  }
+  
+  ###Expected value of the integrated Gaussian Process
+  for(i in 1:m) { 
+  for(j in 1:n) {
+  K.gw[j,i]<-sum(pow(p,quad1[j,i,])*quad2[j,i,])  #### Quadrature function 
+  } #End j loop 
+  } #End i loop	
+
+
+  
+  w.tilde.m<-K.gw%*%K.w.inv%*%w.m
+  
+# Priors
+beta0 ~ dnorm(0.0,1.0E-6)
+p <- cor.p
+tau.y <- pow(sigma.y,-2)
+tau.g ~ dgamma(10,100)
+sigma.y ~ dunif(0.01,1) 
+sigma.g <- pow(tau.g,-0.5)
+
+ 
+}##End model
+
+
+
+================================================
+FILE: R/diagnostics.R
+================================================
+gr_diag<-function(mcmc.array,
+                  pars.check=c("p","sigma.g","beta0")){
+R <- rep(NA,length(pars.check))
+p<-0
+for (parname in pars.check){
+  p <- p+1 # index
+  mcmc.array.temp <- mcmc.array[,,parname]
+  mcmc <- mcmc.list()
+  
+for (chain in 1:dim(mcmc.array.temp)[2]){
+  mcmc[[chain]] <- as.mcmc(mcmc.array.temp[,chain])
+}
+  r<- gelman.diag(mcmc, autoburnin = FALSE, transform = F)$psrf
+  R[p] <-r[,"Point est."]
+  
+}
+
+
+names(R) <- pars.check
+
+
+if (length(R[R>1.1])>0){
+  cat(paste("Poor/no convergence for:", names(R[R>1.1]), "(R = ", round(R[R>1.1],3), ")", "\n"))
+}
+else
+  cat(paste0("Rhat looks good, no  convergence issues indicated for checked parameters \n"))
+
+if(length(R[R>1.1])>0)
+  return(-1)
+else
+  return(0)
+
+}
+
+
+eff_size<-function(mcmc.array,
+                   pars.check=c("p","sigma.g","beta0")){
+  ESS <- rep(NA,length(pars.check))
+  p<-0
+  for (parname in pars.check){
+    p <- p+1 # index
+    mcmc.array.temp <- mcmc.array[,,parname]
+    mcmc <- mcmc.list()
+    
+    for (chain in 1:dim(mcmc.array.temp)[2]){
+      mcmc[[chain]] <- as.mcmc(mcmc.array.temp[,chain])
+    }
+    es<- effectiveSize(mcmc)
+    ESS[p] <-es/(dim(mcmc.array)[1]*dim(mcmc.array)[2])
+    
+  }
+  names(ESS) <- pars.check
+  if (length(ESS[ESS<0.1])>0){
+    cat(paste0("Effective sample size is less than 10% of total iterations for parameter:"," ", names(ESS[ESS<0.1])," ", "(",round(ESS[ESS<0.1],3)*100,"%",")", "\n"))
+    cat(paste0("Additional thinning may be required! \n"))
+    }
+  else
+    cat(paste0("No apparent autocorrelation issues for checked parameters. \n"))
+
+  
+}
+
+mcse<-function(mcmc.array,
+               pars.check=c("p","sigma.g","beta0")){
+  MCSE <- rep(NA,length(pars.check))
+  p<-0
+  for (parname in pars.check){
+    p <- p+1 # index
+    mcmc.array.temp <- mcmc.array[,,parname]
+    mcmc <- mcmc.list()
+    
+    for (chain in 1:dim(mcmc.array.temp)[2]){
+      mcmc[[chain]] <- as.mcmc(mcmc.array.temp[,chain])
+    }
+    es<- effectiveSize(mcmc)
+    MCSE[p] <-(sd(mcmc.array.temp)/es)/sd(mcmc.array.temp)
+    
+  }
+  names(MCSE) <- pars.check
+  if (length(MCSE[MCSE>0.1])>0){
+    cat(paste0("The Monte Carlo standard error is greater than 10% of the posterior standard deviation for parameter:"," ", names(MCSE[MCSE>0.1])," ", "(",round(MCSE[MCSE>0.1],3)*100,"%",")", "\n"))
+    cat(paste0("Sampling error variation appears too large! \n"))
+  }
+  else
+    cat(paste0("The accuracy of the parameter estimation is adequate. \n"))
+}
+
+
+
+
+
+
+
+================================================
+FILE: R/f_data.R
+================================================
+dataprep<-function(data_path = NULL,
+                   dataname="RSL Record",
+                   GIA=FALSE,
+                   rate.gia=NULL,
+                   yocc=2010, 
+                   BP_age_scale = FALSE)
+{
+  
+  ####Create Directories
+  dir.create("fig", showWarnings = FALSE)
+  dir.create(paste0("fig/",dataname),showWarnings = F)
+
+  ## read in data and make any necessary changes
+  data <- read_csv(data_path,
+                   col_types = cols())
+  names(data)[grepl("AgeError",names(data))]<-"AgeError"
+  names(data)[grepl("RSLError",names(data))]<-"RSLError"
+  
+  ########Set up the data########
+  GIA <- rep(GIA, nrow(data))
+  BP <- rep(BP_age_scale, nrow(data))
+  
+    data <- data %>% 
+            mutate(x = ifelse(BP == FALSE, Age, 1950 - Age),
+                   x_thousand = x/1000,
+                   y = ifelse(GIA == FALSE,RSL,(((yocc/1000)-x_thousand)*rate.gia)+RSL),
+                   var_x = (AgeError/1000)^2,
+                   var_y = RSLError^2,
+                   x_lwr = x - AgeError, 
+                   x_upr = x + AgeError,
+                   y_lwr = RSL - RSLError,
+                   y_upr = RSL + RSLError,
+                   y_1_lwr = ifelse(GIA == FALSE, y - RSLError,(((yocc/1000)-x_upr/1000)*rate.gia)+y_lwr),
+                   y_2_lwr = ifelse(GIA == FALSE, y - RSLError,(((yocc/1000)-x_lwr/1000)*rate.gia)+y_lwr),
+                   y_3_upr = ifelse(GIA == FALSE, y + RSLError,(((yocc/1000)-x_lwr/1000)*rate.gia)+y_upr),
+                   y_4_upr = ifelse(GIA == FALSE, y + RSLError,(((yocc/1000)-x_upr/1000)*rate.gia)+y_upr),
+                   x_1_upr = x + AgeError, 
+                   x_2_lwr = x - AgeError,
+                   x_3_lwr = x - AgeError, 
+                   x_4_upr = x + AgeError)
+            
+  ########Setting up the covariance and precision matrices#######
+  N <- nrow(data)
+  V22 <- ifelse(GIA == FALSE,data$var_y,(((rate.gia^2)*data$var_x)+data$var_y)+data$var_x)
+  V12<- ifelse(GIA == FALSE, 0, -rate.gia*data$var_x)
+  V21<- ifelse(GIA == FALSE, 0, -rate.gia*data$var_x)
+  V11 <- data %>% pull(var_x)
+  V<-array(NA,c(2,2,nrow(data)))
+  P<-array(NA,c(2,2,nrow(data)))
+  for(i in 1:N)
+  {
+    V[,,i]<- matrix(c(V11[i],V12[i],V21[i],V22[i]),2,2)
+    P[,,i]<-solve(V[,,i])
+  }
+  
+  get_bounds <- data %>% 
+            select(y_1_lwr:x_4_upr) %>% 
+            mutate(obs_index = 1:n()) %>% 
+            pivot_longer(cols = y_1_lwr:x_4_upr,
+                         names_to = "bounds",
+                         values_to = "value") %>% 
+            mutate(bounds = replace(bounds, bounds %in% c("y_1_lwr","y_2_lwr","y_3_upr","y_4_upr"), "y"),
+                   bounds = replace(bounds, bounds %in% c("x_1_upr","x_2_lwr","x_3_lwr","x_4_upr"), "x")) 
+
+   x_bounds <- get_bounds %>% 
+              filter(bounds == "x") 
+ 
+   y_bounds <- get_bounds %>% 
+                  filter(bounds == "y") 
+ 
+  data_to_plot <- tibble(obs_index = x_bounds$obs_index, 
+                           x = ifelse(rep(BP_age_scale,nrow(x_bounds)) == FALSE,x_bounds$value,1950 - x_bounds$value),
+                           y = y_bounds$value)
+  
+  
+  p <- ggplot(data_to_plot, aes(x = x, y = y))+
+    geom_polygon(aes(group = obs_index),alpha = 0.3) + 
+    geom_point(data = data, aes(x = Age, y = y), alpha = 0.6, pch = 1) +
+    ylab(ifelse(GIA == FALSE, "Relative Sea Level (m)", "Sea Level (m)")) +
+    xlab(ifelse(BP_age_scale == FALSE,"Year CE","Year BP")) + 
+    ggtitle(ifelse(GIA == FALSE,"RSL Reconstruction","SL Reconstruction")) + 
+    theme_classic()
+  
+  if(BP_age_scale == TRUE) {p <- p + scale_x_reverse()}
+
+    suppressMessages(ggsave(paste0("fig/",dataname,"/","Raw Data",ifelse(GIA[1] == FALSE,"","(GIA corrected)"),".pdf", sep = ""),p, width = 7, height = 4))
+    cat("Plots of data saved to fig folder", "\n")
+
+  
+  return(list(data = data,
+              data_to_plot = data_to_plot,
+              P = P,
+              dataname=dataname,
+              GIA=GIA[1],
+              BP_age_scale = BP_age_scale))
+
+}
+
+
+IGPdata<-function(data.raw = NULL,
+                  year1 = NULL,
+                  year2 = NULL,
+                  interval = 25,
+                  html.file = NULL,
+                  incl.errbounds = TRUE,
+                  upper = NULL,
+                  lower = NULL)
+{
+  
+  data <- data.raw$data
+  
+  ############# Set up the grid for the GP ###################
+  nw=30      # Sets the min number of grid points for the derivative
+  if(incl.errbounds){
+  up <- max(data$x_upr)/1000
+  low <- min(data$x_lwr)/1000
+  xgrid=c(low,seq(min(data$x_thousand),max(data$x_thousand),by=(interval/1000)),up)
+  }
+  else{
+    up = ifelse(is.null(upper),max(data$x_thousand),upper)
+    low = ifelse(is.null(lower),min(data$x_thousand),lower)
+    xgrid=c(seq(min(data$x_thousand),max(data$x_thousand),by=(interval/1000)))
+    Ngrid = length(xgrid)
+  }
+  Ngrid = length(xgrid)
+
+  if(Ngrid<nw)
+    stop("Grid length must be at least 30")
+  
+  else
+    cat(paste0("Using a grid size of"," ",Ngrid," ", "and an interval width of"," ",interval," ","years \n"))
+  
+   ###Change data to lower zero for integration
+   minx = min(data$x_thousand)
+   x = data$x_thousand-minx
+   xstar = xgrid - minx
+
+   Dist <- rdist(xstar) ###Distance matrix required for the model 
+   D <- cbind(x,data$y) ###Combine the x,y data for the model 
+   
+   ########Initialize quadrature for the integration########
+   N <- nrow(data)
+   L = 30    ## this sets the precision of the integration quadrature (higher is better but more computationally expensive)
+   index=1:L        
+   cosfunc=cos(((2*index-1)*pi)/(2*L))
+   
+   quad1=array(dim=c(nrow=N,ncol=Ngrid,L))
+   quad2=array(dim=c(nrow=N,ncol=Ngrid,L))
+   
+   for(j in 1:Ngrid)
+   {   for(k in 1:N) 
+   { 
+     quad1[k,j,]=abs((x[k]*cosfunc/2)+(x[k]/2)-xstar[j])^1.99
+     quad2[k,j,]=((x[k]/2)*(pi/L))*(sqrt(1-cosfunc^2))
+   }
+   }
+
+   P <- data.raw$P
+   
+   return(list(year.grid = xgrid*1000,
+               xstar = xstar,
+               N = N,
+               Ngrid = Ngrid,
+               D = D,
+               P = P,
+               Dist = Dist,
+               quad1 = quad1,
+               quad2 = quad2,
+               cosfunc = cosfunc,
+               ppi = pi,
+               L = L,
+               incl.errbounds=incl.errbounds,
+               interval=interval,
+               BP_age_scale = data.raw$BP_age_scale))
+ }
+
+
+================================================
+FILE: R/F_IGPresults.R
+================================================
+GetIGPRes<-function(data.raw=NULL,
+                    interval = 25)
+{
+
+  dir.create("results", showWarnings = FALSE)
+  dir.create(paste0("results/",data.raw$dataname),showWarnings = F)
+  
+  GIA <- data.raw$GIA
+  BP <- data.raw$BP_age_scale
+  
+  load(paste0("modeloutput/",data.raw$dataname,"/EstsandRates.rda"))
+  
+  modeldat <- IGPdata(data.raw = data.raw,
+                      interval = interval,
+                      incl.errbounds = EstsandRates$incl.errbounds)
+  
+
+  
+  pred_s <- suppressWarnings(as_tibble(EstsandRates$pred) %>% 
+              rename_at(vars(everything()),~ as.character(modeldat$year.grid)) %>% 
+              pivot_longer(everything(),names_to = "year") %>% 
+              mutate(year = as.numeric(year)))
+  SLestimates <- pred_s %>% 
+                  group_by(year) %>% 
+                  summarise(SL_est = mean(value),
+                            SL_lwr = mean(value) - 2*(sd(value)),
+                            SL_upr = mean(value) + 2*(sd(value))) %>% 
+                  mutate(year = ifelse(rep(data.raw$BP_age_scale,length(SL_est)) == FALSE, year, 1950 - year))
+  
+  dydt_s <- suppressWarnings(as_tibble(EstsandRates$dydt) %>% 
+            rename_at(vars(everything()),~ as.character(modeldat$year.grid)) %>% 
+            pivot_longer(everything(),names_to = "year") %>% 
+            mutate(year = as.numeric(year)))
+
+  SLrates <- dydt_s %>% 
+             group_by(year) %>% 
+             summarise(rate_est = mean(value),
+                       rate_lwr = mean(value) - 2*(sd(value)),
+                       rate_upr = mean(value) + 2*(sd(value))) %>% 
+             mutate(year = ifelse(rep(data.raw$BP_age_scale,length(rate_est)) == FALSE, year, 1950 - year))
+  
+  rate_mean <- mean(dydt_s$value)
+  rate_mean_lwr <- quantile(dydt_s$value,probs = 0.025)
+  rate_mean_upr <- quantile(dydt_s$value,probs = 0.975)
+  
+  write.csv(SLestimates,file=paste0("results/",data.raw$dataname,"/",ifelse(data.raw$GIA == FALSE,"RSL_Estimates.csv", "SL_Estimates.csv")))
+  write.csv(SLrates,file=paste0("results/",data.raw$dataname,"/",ifelse(data.raw$GIA == FALSE, "RSL_Rates.csv","SL_Rates.csv")))
+  cat(paste0("Spreadsheets containing ", ifelse(data.raw$GIA == FALSE, "RSL estimates ","GIA Corrected SL estimates "),"and rates for"," ",data.raw$dataname," ", "are saved in results folder","\n"))
+
+  return(list(SLestimates = SLestimates,
+              SLrates = SLrates, 
+              modeldat = modeldat,
+              rate_mean = rate_mean,
+              rate_mean_lwr = rate_mean_lwr,
+              rate_mean_upr = rate_mean_upr))
+}
+
+IGPResults<-function(data.raw=NULL,
+                   interval = 25,
+                   xlimits=NULL,
+                   ylimits=NULL,
+                   ratelimits=NULL)
+{
+
+
+  model_res <- GetIGPRes(data.raw=data.raw,
+                         interval = interval)
+  modeldat <- model_res$modeldat
+  
+  sl_dat <- model_res$SLestimates
+  rate_dat <- model_res$SLrates
+  data_to_plot <- data.raw$data_to_plot
+  
+  p1 <- ggplot(sl_dat, aes(x = year, y = SL_est))+
+    geom_line() +
+    geom_ribbon(aes(x = year, ymin = SL_lwr, ymax = SL_upr), alpha = 0.5) +
+    geom_polygon(data = data_to_plot, aes(x = x, y = y,group = obs_index),alpha = 0.1) + 
+    ylab(ifelse(data.raw$GIA == FALSE, "Relative Sea Level (m)", "Sea Level (m)")) +
+    xlab(ifelse(data.raw$BP_age_scale == FALSE,"Year CE","Year BP")) + 
+    ggtitle(ifelse(data.raw$GIA == FALSE,"RSL Estimates","SL Estimates")) + 
+    theme_classic()
+  
+  suppressMessages(ggsave(paste0("fig/",data.raw$dataname,"/","Results_SL Estimates", ifelse(data.raw$GIA == FALSE,"","(GIA corrected)"),".pdf", sep = ""),p1, width = 7, height = 4))
+  
+  p2 <- ggplot(rate_dat, aes(x = year, y = rate_est))+
+    geom_line() +
+    geom_ribbon(aes(x = year, ymin = rate_lwr, ymax = rate_upr), alpha = 0.5) +
+    ylab(ifelse(data.raw$GIA == FALSE, "Rate of RSL Change (mm/yr)", "Rate of SL Change (mm/yr)")) +
+    xlab(ifelse(data.raw$BP_age_scale == FALSE,"Year CE","Year BP")) + 
+    ggtitle(ifelse(data.raw$GIA == FALSE,"RSL Rates","SL Rates")) + 
+    theme_classic()
+  
+  suppressMessages(ggsave(paste0("fig/",data.raw$dataname,"/","Results_Rate Estimates", ifelse(data.raw$GIA == FALSE,"","(GIA corrected)"),".pdf", sep = ""),p2, width = 7, height = 4))
+  
+  cat("Plots of estimates and rates saved in fig folder \n")
+  
+  return(list(mean_rate = model_res$rate_mean, 
+              mean_rate_lwr = model_res$rate_mean_lwr,
+              mean_rate_upr = model_res$rate_mean_upr))
+}
+
+
+
+================================================
+FILE: R/F_output.R
+================================================
+IGPests<-function(data.raw=NULL,
+                  interval = 25,
+                  incl.errbounds = TRUE)
+{
+  dataname<-data.raw$dataname
+  
+  # Get model data
+  modeldat <- IGPdata(data.raw = data.raw,
+                      interval = interval,
+                      incl.errbounds = incl.errbounds)
+  # Get model output
+  load(paste0("modeloutput/",dataname,"/mcmc.array.rda"))
+  n_iter <- length(mcmc.array[,1,paste0("beta0")])
+  
+  #Get predictions on a grid of x values.
+  N.grid <- modeldat$Ngrid
+  x.grid <- modeldat$xstar
+  xstar <- modeldat$xstar
+
+  Dist <- modeldat$Dist
+  
+  #Set up the matrix that will contain the estimates
+  pred <- matrix(NA,ncol=N.grid,nrow=n_iter)
+  K.gw<-K<-K.w.inv<-array(NA,c(n_iter, N.grid, N.grid))
+  
+  ########Initialize quadrature for the integration########
+  L=30    ## this sets the precision of the integration quadrature (higher is better but more computationally expensive)
+  index=1:L        
+  cosfunc=cos(((2*index-1)*pi)/(2*L))
+  
+  quad1=array(dim=c(nrow=N.grid,ncol=N.grid,L))
+  quad2=array(dim=c(nrow=N.grid,ncol=N.grid,L))
+  
+  for(j in 1:N.grid)
+  {   
+    for(k in 1:N.grid) 
+  { 
+      quad1[k,j,]=abs((x.grid[k]*cosfunc/2)+(x.grid[k]/2)-xstar[j])^1.99
+      quad2[k,j,]=((x.grid[k]/2)*(pi/L))*(sqrt(1-cosfunc^2))
+  }
+  }
+  
+  
+  #Get posterior samples of rates
+  w.ms<-array(NA, c(n_iter,N.grid))
+  for(j in 1:N.grid)
+  {
+    w.ms[,j]<-mcmc.array[,1,paste0("w.m[",j,"]")]
+  }
+  
+  #Get estimates
+  for(i in 1:n_iter) {
+    for(k in 1:N.grid) { 
+      for(j in 1:N.grid) {
+        K.gw[i,j,k]<-sum((mcmc.array[i,1,paste0("p")]^quad1[j,k,])*quad2[j,k,])  #### Quadrature function 
+      } #End j loop 
+    } #End k loop  
+    
+    K[i,,]<-mcmc.array[i,1,paste0("p")]^(Dist^1.99)
+    K.w.inv[i,,]<-solve(K[i,,])
+    pred[i,] <- mcmc.array[i,1,paste0("beta0")]+K.gw[i,,]%*%K.w.inv[i,,]%*%w.ms[i,]
+  } #End i loop
+  
+  dydt<-array(NA,c(n_iter,N.grid))
+  mean.dydt<-rep(NA,n_iter)
+  for(i in 1:n_iter){
+    dydt[i,] <- w.ms[i,]
+    mean.dydt[i]<-mean(dydt[i,])
+  }
+  
+  mean.rate <- mean(mean.dydt)
+  sd.rate <- sd(mean.dydt)
+  u95.rate <- quantile(mean.dydt,probs=0.975)
+  l95.rate <- quantile(mean.dydt,probs=0.025)
+  
+  EstsandRates<-list(pred=pred,
+                     dydt=dydt,
+                     mean.rate=mean.rate,
+                     sd.rate=sd.rate,
+                     l95.rate=l95.rate,
+                     u95.rate=u95.rate,
+                     incl.errbounds = incl.errbounds)
+  save(EstsandRates, file=paste0("modeloutput/",dataname,"/EstsandRates.rda"))
+  cat("EIV-IGP posterior samples for estimates and rates saved to modeloutput folder", "\n")
+}
+
+
+
+================================================
+FILE: R/F_rsldiff.R
+================================================
+RSLDiff<-function(data.one=NULL,data.two=NULL,modeldat.one=NULL,modeldat.two=NULL,num.pred=1000)
+{
+  dir.create(paste0("results/","RSLDifferences"),showWarnings = F)
+  dataname.one<-data.one$dataname
+  dataname.two<-data.two$dataname
+  load(paste0("modeloutput/",dataname.one,"/run.mcmc.RData"))
+  mcmcmodel.one <- run.mcmc$BUGSoutput$sims.list
+  load(paste0("modeloutput/",dataname.two,"/run.mcmc.RData"))
+  mcmcmodel.two <- run.mcmc$BUGSoutput$sims.list
+  
+  #Use the predictive distibution of the Gaussian process to determine the maximum Z score
+  #This needs to be carried out on a grid of x values.
+  N.grid.one <- modeldat.one$Ngrid
+  x.grid.one <- modeldat.one$xstar
+  xstar.one<-modeldat.one$xstar
+  
+  N.grid.two <- modeldat.two$Ngrid
+  x.grid.two <- modeldat.two$xstar
+  xstar.two<-modeldat.two$xstar
+  
+  xpred.one<-round(modeldat.one$year.grid,digits=0)
+  xpred.two<-round(modeldat.two$year.grid,digits=0)
+  
+  index.year.one<-match(xpred.two,xpred.one)
+  index.year.one<-index.year.one[which(!is.na(index.year.one))]
+  
+  index.year.two<-match(xpred.one,xpred.two)
+  index.year.two<-index.year.two[which(!is.na(index.year.two))]
+  
+  
+  #Set up the matrix that will contain the predictions
+  pred.one.temp<-matrix(NA,ncol=N.grid.one,nrow=num.pred)
+  pred.two.temp<-matrix(NA,ncol=N.grid.two,nrow=num.pred)
+  
+  K.gw.one<-matrix(NA, N.grid.one, N.grid.one)
+  K.gw.two<-matrix(NA, N.grid.two, N.grid.two)
+  
+  ########Initialize quadrature for the integration########
+  L=30    ## this sets the precision of the integration quadrature (higher is better but more computationally expensive)
+  index=1:L        
+  cosfunc=cos(((2*index-1)*pi)/(2*L))
+  
+  quad1.one=array(dim=c(nrow=N.grid.one,ncol=N.grid.one,L))
+  quad2.one=array(dim=c(nrow=N.grid.one,ncol=N.grid.one,L))
+  quad1.two=array(dim=c(nrow=N.grid.two,ncol=N.grid.two,L))
+  quad2.two=array(dim=c(nrow=N.grid.two,ncol=N.grid.two,L))
+  
+  for(j in 1:N.grid.one)
+  {   for(k in 1:N.grid.one) 
+  { 
+  quad1.one[k,j,]=abs((x.grid.one[k]*cosfunc/2)+(x.grid.one[k]/2)-xstar.one[j])^1.99
+  quad2.one[k,j,]=((x.grid.one[k]/2)*(pi/L))*(sqrt(1-cosfunc^2))
+  }
+  }
+  for(j in 1:N.grid.two)
+  {   for(k in 1:N.grid.two) 
+  {
+  quad1.two[k,j,]=abs((x.grid.two[k]*cosfunc/2)+(x.grid.two[k]/2)-xstar.two[j])^1.99
+  quad2.two[k,j,]=((x.grid.two[k]/2)*(pi/L))*(sqrt(1-cosfunc^2))
+  
+  }
+  }
+  
+  for(i in 1:N.grid.one) { 
+    for(j in 1:N.grid.one) {
+      K.gw.one[j,i]<-sum((mean(mcmcmodel.one$p)^quad1.one[j,i,])*quad2.one[j,i,])  #### Quadrature function 
+    }
+  }
+      for(i in 1:N.grid.two) { 
+        for(j in 1:N.grid.two) {
+          
+      K.gw.two[j,i]<-sum((mean(mcmcmodel.two$p)^quad1.two[j,i,])*quad2.two[j,i,])  #### Quadrature function 
+      
+    } #End j loop 
+  } #End i loop  
+  
+  pred.one<-pred.two<-pred.diff <- matrix(NA,ncol=length(index.year.one),nrow=num.pred)
+  
+  #Sampling from the predictive distibution
+  for(i in 1:num.pred) {
+    pred.one.temp[i,] <- mcmcmodel.one$beta0[i]+K.gw.one%*%mcmcmodel.one$K.w.inv[i,,]%*%mcmcmodel.one$w.m[i,]
+    pred.two.temp[i,] <- mcmcmodel.two$beta0[i]+K.gw.two%*%mcmcmodel.two$K.w.inv[i,,]%*%mcmcmodel.two$w.m[i,]
+    
+    pred.one[i,]<-pred.one.temp[i,index.year.one]
+    pred.two[i,]<-pred.two.temp[i,index.year.two]
+    pred.diff[i,]<-pred.one[i,]-pred.two[i,]
+  }
+  
+  diff.mean<-apply(pred.diff,2,mean)
+  pred.one.mean<-apply(pred.one,2,mean)
+  pred.two.mean<-apply(pred.two,2,mean)
+  
+  diff.u95<-apply(pred.diff,2,quantile,prob=0.975,na.rm=T)
+  diff.l95<-apply(pred.diff,2,quantile,prob=0.025,na.rm=T)
+  
+  
+  pdf(paste0("results/","RSLDifferences/","Differences",".pdf", sep = ""),height=6,width=10)
+  
+  plot(xpred.one[index.year.one],diff.mean,col="red",type="l",ylab="RSL Differences",xlab="Year CE ", main=" ",ylim=range(c(diff.l95,diff.u95)),xlim=range(xpred.one[index.year.one]),cex.axis=1.1)
+  polygon(c(xpred.one[index.year.one], rev(xpred.one[index.year.one])),c(diff.l95,rev(diff.u95)), col=rgb(0.5,0,0.5,alpha=0.3),border="white")
+  #polygon(rate_xxx, rate_zzz, col=colors()[596], border =colors()[596])
+  abline(h=0,lty=2)
+  dev.off()
+  
+   pdf(paste0("results/","RSLDifferences/","RSLDifferences",".pdf", sep = ""))
+   
+   plot(-10,-10,xlim=c(min(data.one$KYear*1000,data.two$KYear*1000),max(data.one$KYear*1000,data.two$KYear*1000)),ylim=c(min(data.one$RSL,data.two$RSL),max(data.one$RSL,data.two$RSL)),ylab="Relative Sea Level (m)",col=colors()[31],xlab="Year CE",main=paste0("RSL Differences (", modeldat.one$interval," ", "yr time steps)"),cex.axis=0.9)
+   points(data.one$KYear*1000,data.one$RSL,col=rgb(1,0,0,alpha=0.5),lwd=0.5)
+   points(data.two$KYear*1000,data.two$RSL,col=rgb(0,0,1,alpha=0.5),lwd=0.5)
+   polygon(c(xpred.one[index.year.one],rev(xpred.one[index.year.one])),c(pred.one.mean,rev(pred.two.mean)),col=rgb(0.5,0,0.5,alpha=0.3),border="white")
+   lines(xpred.one[index.year.one],pred.one.mean,col="red",lwd=1.5)
+   lines(xpred.one[index.year.one],pred.two.mean,col="blue",lwd=1.5)
+   legend("topleft",legend=c(dataname.one,dataname.two),col=c("red","blue"),lty=c(1,1),bty="n")
+   dev.off()
+  
+  
+  rsldiff<-cbind(year.pred=xpred.one[index.year.one],diff.mean,diff.l95,diff.u95)
+  write.csv(rsldiff,file="results/RSLDifferences/Differences.csv")
+  
+  
+  dir.create(paste0("modeloutput/","RSLDifferences"),showWarnings = F)
+  pred.differences<-list(pred.one=pred.one.temp,pred.two=pred.two.temp,pred.diff=pred.diff)
+  save(pred.differences, file=paste0("modeloutput/","RSLDifferences","/pred.differences.rda"))
+  cat("Posteriors samples for RSL predictions and differences saved to modeloutput folder", "\n")
+}
+
+Diffresults<-function(data.one=NULL,data.two=NULL,modeldat.one=NULL,modeldat.two=NULL)
+{
+  load(paste0("modeloutput/","RSLDifferences","/pred.differences.rda"))
+
+  dataname.one<-data.one$dataname
+  dataname.two<-data.two$dataname
+  yfit.one=pred.differences$pred.one
+  xpred.one<-modeldat.one$year.grid
+  meanfit.one<-apply(yfit.one,2,mean)
+  u95.one<-meanfit.one+(2*apply(yfit.one,2,sd))
+  l95.one<-meanfit.one-(2*apply(yfit.one,2,sd))
+  u68.one<-meanfit.one+(1*apply(yfit.one,2,sd))
+  l68.one<-meanfit.one-(1*apply(yfit.one,2,sd))
+  
+  yfit.two=pred.differences$pred.two
+  xpred.two<-modeldat.two$year.grid
+  meanfit.two<-apply(yfit.two,2,mean)
+  u95.two<-meanfit.two+(2*apply(yfit.two,2,sd))
+  l95.two<-meanfit.two-(2*apply(yfit.two,2,sd))
+  u68.two<-meanfit.two+(1*apply(yfit.two,2,sd))
+  l68.two<-meanfit.two-(1*apply(yfit.two,2,sd))
+  
+  dir.create(paste0("fig/","RSLDifferences"),showWarnings = F)
+  
+  pdf(paste0("fig/","RSLDifferences/","RSLDifferences",".pdf", sep = ""))
+  
+  plot(-10,-10,xlim=c(min(data.one$KYear*1000,data.two$KYear*1000),max(data.one$KYear*1000,data.two$KYear*1000)),ylim=c(min(data.one$RSL,data.two$RSL),max(data.one$RSL,data.two$RSL)),ylab="Relative Sea Level (m)",col=colors()[31],xlab="Year CE",main=paste0("RSL Differences(", modeldat.one$interval," ", "yr time steps)"),cex.axis=0.9)
+  points(data.one$KYear*1000,data.one$RSL,col=rgb(1,0,0,alpha=0.5),lwd=0.5)
+  points(data.two$KYear*1000,data.two$RSL,col=rgb(0,0,1,alpha=0.5),lwd=0.5)
+  #polygon(c(xpred.one,rev(xpred.one)),c(meanfit.one,rev(meanfit.two)),col=rgb(0.5,0,0.5,alpha=0.3),border="white")
+  lines(xpred.one,meanfit.one,col="red",lwd=1.5)
+  lines(xpred.two,meanfit.two,col="blue",lwd=1.5)
+  legend("topleft",legend=c(dataname.one,dataname.two),col=c("red","blue"),lty=c(1,1),bty="n")
+  dev.off()
+  
+  cat(paste0("Plot of RSL differences between ",dataname.one," and ",dataname.two, " saved to fig folder"),sep="\n")
+  
+  dir.create(paste0("results/","RSLDifferences"),showWarnings = F)
+  
+  diff.mean<-apply(pred.differences$pred.diff,2,mean)
+  diff.u95<-apply(pred.differences$pred.diff,2,quantile,prob=0.975,na.rm=T)
+  diff.l95<-apply(pred.differences$pred.diff,2,quantile,prob=0.025,na.rm=T)
+  
+  modelpredone<-cbind(year.pred=xpred.one,RSL.pred=meanfit.one,l95=l95.one,u95=u95.one,l68=l68.one,u68=u68.one)
+  write.csv(modelpredone,file=paste0("results/RSLDifferences/",dataname.one,"Predictions.csv"))
+  
+  modelpredtwo<-cbind(year.pred=xpred.two,RSL.pred=meanfit.two,l95=l95.two,u95=u95.two,l68=l68.two,u68=u68.two)
+  write.csv(modelpredtwo,file=paste0("results/RSLDifferences/",dataname.two,"Predictions.csv"))
+  
+  rsldiff<-cbind(year.pred=xpred.two,diff.mean,diff.l95,diff.u95)
+  write.csv(rsldiff,file="results/RSLDifferences/Differences.csv")
+  
+  cat(paste0("Spredsheets of RSL predictions and differences between ",dataname.one," and ",dataname.two, " saved to results folder"),sep="\n")
+}
+
+
+SLDiff<-function(data.one=NULL,data.two=NULL,modeldat.one=NULL,modeldat.two=NULL,num.pred=1000)
+{
+  dataname.one<-data.one$dataname
+  dataname.two<-data.two$dataname
+  load(paste0("modeloutput/",dataname.one,"/run.mcmc.RData"))
+  mcmcmodel.one <- run.mcmc$BUGSoutput$sims.list
+  load(paste0("modeloutput/",dataname.two,"/run.mcmc.RData"))
+  mcmcmodel.two <- run.mcmc$BUGSoutput$sims.list
+  
+  #Use the predictive distibution of the Gaussian process to determine the maximum Z score
+  #This needs to be carried out on a grid of x values.
+  N.grid <- modeldat.one$Ngrid
+  x.grid.one <- modeldat.one$xstar
+  xstar.one<-modeldat.one$xstar
+  
+  x.grid.two <- modeldat.two$xstar
+  xstar.two<-modeldat.two$xstar
+  
+  #Set up the matrix that will contain the predictions
+  pred.one<-pred.two<-pred.diff <- matrix(NA,ncol=N.grid,nrow=num.pred)
+  K.gw.one<-K.gw.two<-matrix(NA, N.grid, N.grid)
+  
+  ########Initialize quadrature for the integration########
+  L=30    ## this sets the precision of the integration quadrature (higher is better but more computationally expensive)
+  index=1:L        
+  cosfunc=cos(((2*index-1)*pi)/(2*L))
+  
+  quad1.one=array(dim=c(nrow=N.grid,ncol=N.grid,L))
+  quad2.one=array(dim=c(nrow=N.grid,ncol=N.grid,L))
+  quad1.two=array(dim=c(nrow=N.grid,ncol=N.grid,L))
+  quad2.two=array(dim=c(nrow=N.grid,ncol=N.grid,L))
+  
+  for(j in 1:N.grid)
+  {   for(k in 1:N.grid) 
+  { 
+    quad1.one[k,j,]=abs((x.grid.one[k]*cosfunc/2)+(x.grid.one[k]/2)-xstar.one[j])^1.99
+    quad2.one[k,j,]=((x.grid.one[k]/2)*(pi/L))*(sqrt(1-cosfunc^2))
+    
+    quad1.two[k,j,]=abs((x.grid.two[k]*cosfunc/2)+(x.grid.two[k]/2)-xstar.two[j])^1.99
+    quad2.two[k,j,]=((x.grid.two[k]/2)*(pi/L))*(sqrt(1-cosfunc^2))
+    
+  }
+  }
+  
+  for(i in 1:N.grid) { 
+    for(j in 1:N.grid) {
+      K.gw.one[j,i]<-sum((mean(mcmcmodel.one$p)^quad1.one[j,i,])*quad2.one[j,i,])  #### Quadrature function 
+      K.gw.two[j,i]<-sum((mean(mcmcmodel.two$p)^quad1.two[j,i,])*quad2.two[j,i,])  #### Quadrature function 
+      
+    } #End j loop 
+  } #End i loop  
+  
+  
+  #Sampling from the predictive distibution
+  for(i in 1:num.pred) {
+    pred.one[i,] <- mcmcmodel.one$beta0[i]+K.gw.one%*%mcmcmodel.one$K.w.inv[i,,]%*%mcmcmodel.one$w.m[i,]
+    pred.two[i,] <- mcmcmodel.two$beta0[i]+K.gw.two%*%mcmcmodel.two$K.w.inv[i,,]%*%mcmcmodel.two$w.m[i,]
+    pred.diff[i,]<-pred.one[i,]-pred.two[i,]
+  }
+  
+  dir.create(paste0("modeloutput/","SLDifferences"),showWarnings = F)
+  pred.differences<-list(pred.one=pred.one,pred.two=pred.two,pred.diff=pred.diff)
+  save(pred.differences, file=paste0("modeloutput/","SLDifferences","/pred.differences.rda"))
+  cat("Posteriors samples for SL predictions and differences saved to modeloutput folder", "\n")
+}
+
+Diffresults.SL<-function(data.one=NULL,data.two=NULL,modeldat.one=NULL,modeldat.two=NULL)
+{
+  load(paste0("modeloutput/","SLDifferences","/pred.differences.rda"))
+  
+  dataname.one<-data.one$dataname
+  dataname.two<-data.two$dataname
+  yfit.one=pred.differences$pred.one
+  xpred.one<-modeldat.one$year.grid
+  meanfit.one<-apply(yfit.one,2,mean)
+  u95.one<-meanfit.one+(2*apply(yfit.one,2,sd))
+  l95.one<-meanfit.one-(2*apply(yfit.one,2,sd))
+  u68.one<-meanfit.one+(1*apply(yfit.one,2,sd))
+  l68.one<-meanfit.one-(1*apply(yfit.one,2,sd))
+  
+  yfit.two=pred.differences$pred.two
+  xpred.two<-modeldat.two$year.grid
+  meanfit.two<-apply(yfit.two,2,mean)
+  u95.two<-meanfit.two+(2*apply(yfit.two,2,sd))
+  l95.two<-meanfit.two-(2*apply(yfit.two,2,sd))
+  u68.two<-meanfit.two+(1*apply(yfit.two,2,sd))
+  l68.two<-meanfit.two-(1*apply(yfit.two,2,sd))
+  
+  dir.create(paste0("fig/","SLDifferences"),showWarnings = F)
+  
+  pdf(paste0("fig/","SLDifferences/","SLDifferences",".pdf", sep = ""))
+  
+  plot(-10,-10,xlim=c(min(data.one$KYear*1000,data.two$KYear*1000),max(data.one$KYear*1000,data.two$KYear*1000)),ylim=c(min(data.one$RSL,data.two$RSL),max(data.one$RSL,data.two$RSL)),ylab="Relative Sea Level (m)",col=colors()[31],xlab="Year CE",main=paste0("SL Differences(", modeldat.one$interval," ", "yr time steps)"),cex.axis=0.9)
+  points(data.one$KYear*1000,data.one$RSL,col=rgb(1,0,0,alpha=0.5),lwd=0.5)
+  points(data.two$KYear*1000,data.two$RSL,col=rgb(0,0,1,alpha=0.5),lwd=0.5)
+  polygon(c(xpred.one,rev(xpred.one)),c(meanfit.one,rev(meanfit.two)),col=rgb(0.5,0,0.5,alpha=0.3),border="white")
+  lines(xpred.one,meanfit.one,col="red",lwd=1.5)
+  lines(xpred.two,meanfit.two,col="blue",lwd=1.5)
+  legend("topleft",legend=c(dataname.one,dataname.two),col=c("red","blue"),lty=c(1,1),bty="n")
+  dev.off()
+  
+  cat(paste0("Plot of SL differences between ",dataname.one," and ",dataname.two, " saved to fig folder"),sep="\n")
+  
+  dir.create(paste0("results/","SLDifferences"),showWarnings = F)
+  
+  diff.mean<-apply(pred.differences$pred.diff,2,mean)
+  diff.u95<-apply(pred.differences$pred.diff,2,quantile,prob=0.975,na.rm=T)
+  diff.l95<-apply(pred.differences$pred.diff,2,quantile,prob=0.025,na.rm=T)
+  
+  modelpredone<-cbind(year.pred=xpred.one,SL.pred=meanfit.one,l95=l95.one,u95=u95.one,l68=l68.one,u68=u68.one)
+  write.csv(modelpredone,file=paste0("results/SLDifferences/",dataname.one,"Predictions.csv"))
+  
+  modelpredtwo<-cbind(year.pred=xpred.two,SL.pred=meanfit.two,l95=l95.two,u95=u95.two,l68=l68.two,u68=u68.two)
+  write.csv(modelpredtwo,file=paste0("results/SLDifferences/",dataname.two,"Predictions.csv"))
+  
+  SLdiff<-cbind(year.pred=xpred.two,diff.mean,diff.l95,diff.u95)
+  write.csv(SLdiff,file="results/SLDifferences/Differences.csv")
+  
+  cat(paste0("Spredsheets of SL predictions and differences between ",dataname.one," and ",dataname.two, " saved to results folder"),sep="\n")
+}
+
+
+RateDiff<-function(data.one=NULL,
+                   data.two=NULL,
+                   modeldat.one=NULL,
+                   modeldat.two=NULL,
+                   num.pred=1000,
+                   main.diff="Rate Difference",
+                   main.rate="Rates Overlayed")
+{
+  dataname.one<-data.one$dataname
+  dataname.two<-data.two$dataname
+  load(paste0("modeloutput/",dataname.one,"/run.mcmc.RData"))
+  mcmcmodel.one <- run.mcmc$BUGSoutput$sims.list
+  load(paste0("modeloutput/",dataname.two,"/run.mcmc.RData"))
+  mcmcmodel.two <- run.mcmc$BUGSoutput$sims.list
+  
+  #Use the predictive distibution of the Gaussian process to determine the maximum Z score
+  #This needs to be carried out on a grid of x values.
+  N.grid <- modeldat.one$Ngrid
+  x.grid.one <- modeldat.one$xstar
+  xstar.one<-modeldat.one$xstar
+  
+  x.grid.two <- modeldat.two$xstar
+  xstar.two<-modeldat.two$xstar
+  
+  xpred.one<-round(modeldat.one$year.grid,digits=0)
+  xpred.two<-round(modeldat.two$year.grid,digits=0)
+  
+  index.year.one<-match(xpred.two,xpred.one)
+  index.year.one<-index.year.one[which(!is.na(index.year.one))]
+  
+  index.year.two<-match(xpred.one,xpred.two)
+  index.year.two<-index.year.two[which(!is.na(index.year.two))]
+  
+  #Set up the matrix that will contain the predictions
+  pred.one<-pred.two<-pred.diff <- matrix(NA,ncol=length(index.year.one),nrow=num.pred)
+  
+  
+  #Sampling from the predictive distibution
+  for(i in 1:num.pred) {
+    pred.one[i,] <- mcmcmodel.one$w.m[i,index.year.one]
+    pred.two[i,] <- mcmcmodel.two$w.m[i,index.year.two]
+    pred.diff[i,]<-pred.one[i,]-pred.two[i,]
+  }
+  
+  dir.create(paste0("modeloutput/","RateDifferences"),showWarnings = F)
+  rate.differences<-list(pred.one=pred.one,pred.two=pred.two,pred.diff=pred.diff)
+  save(rate.differences, file=paste0("modeloutput/","RateDifferences","/rate.differences.rda"))
+  cat("Posteriors samples for rates and differences saved to modeloutput folder", "\n")
+  
+  dir.create(paste0("results/","RateDifferences"),showWarnings = F)
+  
+  diff.mean<-apply(rate.differences$pred.diff,2,mean)
+  diff.u95<-apply(rate.differences$pred.diff,2,quantile,prob=0.975,na.rm=T)
+  diff.l95<-apply(rate.differences$pred.diff,2,quantile,prob=0.025,na.rm=T)
+  
+  Ratediff<-cbind(year.pred=xpred.one[index.year.one],diff.mean,diff.l95,diff.u95)
+  write.csv(Ratediff,file="results/RateDifferences/Differences.csv")
+  
+  cat(paste0("Spredsheets of SL predictions and differences between ",dataname.one," and ",dataname.two, " saved to results folder"),sep="\n")
+  
+  rates.one=rate.differences$pred.one
+  mean.one<-apply(rates.one,2,mean)
+  u95.one<-apply(rates.one,2,quantile,prob=0.975,na.rm=T)
+  l95.one<-apply(rates.one,2,quantile,prob=0.025,na.rm=T)
+
+  rates.two=rate.differences$pred.two
+  mean.two<-apply(rates.two,2,mean)
+  u95.two<-apply(rates.two,2,quantile,prob=0.975,na.rm=T)
+  l95.two<-apply(rates.two,2,quantile,prob=0.025,na.rm=T)
+  
+
+  pdf(paste0("results/","RateDifferences/","RateDifferences",".pdf", sep = ""),height=6,width=10)
+  
+  plot(xpred.one[index.year.one],mean.one,col="red",type="l",ylab="Rate (mm/yr)",xlab="Year AD ", main=main.rate,ylim=c(min(l95.one, l95.two),max(u95.one,u95.two)),xlim=range(xpred.one[index.year.one]),cex.axis=1.1)
+  lines(xpred.two[index.year.two],mean.two,col="blue")
+  #polygon(c(xpred.one,rev(xpred.one)),c(mean.one,rev(mean.two)),col=rgb(0.5,0,0.5,alpha=0.3),border="white")
+  
+  polygon(c(xpred.one[index.year.one], rev(xpred.one[index.year.one])),c(l95.one,rev(u95.one)), col=rgb(1,0,0,alpha=0.3),border="white")
+  polygon(c(xpred.two[index.year.two], rev(xpred.two[index.year.two])),c(l95.two,rev(u95.two)), col=rgb(0,0,1,alpha=0.3),border="white")
+  #abline(h=0)
+  #polygon(rate_xxx, rate_zzz, col=colors()[596], border =colors()[596])
+  dev.off()
+  
+  pdf(paste0("results/","RateDifferences/","Differences",".pdf", sep = ""),height=6,width=10)
+  
+  plot(xpred.one[index.year.one],diff.mean,col="red",type="l",ylab="Rate Differences",xlab="Year AD ", main=main.diff,ylim=range(c(diff.l95,diff.u95)),xlim=range(xpred.one[index.year.one]),cex.axis=1.1)
+  polygon(c(xpred.one[index.year.one], rev(xpred.one[index.year.one])),c(diff.l95,rev(diff.u95)), col=rgb(0.5,0,0.5,alpha=0.3),border="white")
+  #polygon(rate_xxx, rate_zzz, col=colors()[596], border =colors()[596])
+  abline(h=0,lty=2)
+  dev.off()
+  
+ }
+
+
+
+================================================
+FILE: R/F_runIGP.R
+================================================
+RunIGPModel<-function(data.raw=NULL,
+                      cor.p=0.2,
+                      n.iter=25000,
+                      n.burnin=5000,
+                      n.thin=10,
+                      ChainNums=seq(1,2),
+                      fast=FALSE,
+                      run.on.server=FALSE,
+                      incl.errbounds = TRUE,
+                      interval = 25){
+  # Create a directory "modeloutput" in current working directory
+  dataname<-data.raw$dataname
+  dir.create("modeloutput", showWarnings = FALSE)
+  dir.create(paste0("modeloutput/",dataname),showWarnings = F)
+  output.dir<-file.path(paste0("modeloutput/",dataname))
+  
+  # Get model data
+  modeldat <- IGPdata(data.raw = data.raw,
+                      interval = interval,
+                      incl.errbounds = incl.errbounds)
+  
+  ###The necessary data
+  jags.data <- list(n = modeldat$N,
+                    m = modeldat$Ngrid,
+                    P = modeldat$P,
+                    D = modeldat$D,
+                    L = modeldat$L,
+                    ppi = modeldat$ppi,
+                    cosfunc = modeldat$cosfunc,
+                    Dist = modeldat$Dist,
+                    xstar = modeldat$xstar,
+                    quad1 = modeldat$quad1,
+                    quad2 = modeldat$quad2,
+                    kappa = 1.99,
+                    cor.p = cor.p)    
+  
+  ###Paramaters to save 
+  jags.pars <- c("beta0",
+                 "sigma.g",
+                 "p",
+                 "w.m",
+                 "mu",
+                 "sigma.y",
+                 "K.w.inv")
+  
+  ########Run the model########
+  if(fast)
+  {
+    model.file="model/EIVIGPfast.txt"
+  }
+  
+  if(!fast)
+  {
+    model.file="model/EIVIGP.txt"
+  }
+  
+  
+  if (run.on.server) {
+    foreach(chainNum=ChainNums) %dopar% {
+      cat(paste("Start chain ID ", chainNum), "\n")
+      
+      InternalRunOneChain(chainNum = chainNum,
+                          jags.data = jags.data,
+                          jags.pars = jags.pars,
+                          n.burnin = n.burnin,
+                          n.iter = n.iter,
+                          n.thin = n.thin,
+                          model.file = model.file,
+                          output.dir = output.dir)
+    } # end chainNums
+  } else {
+    for (chainNum in ChainNums){
+      cat(paste("Start chain ID ", chainNum), "\n")
+      
+      InternalRunOneChain(chainNum = chainNum,
+                          jags.data = jags.data,
+                          jags.pars = jags.pars,
+                          n.burnin = n.burnin,
+                          n.iter = n.iter,
+                          n.thin = n.thin,
+                          model.file = model.file,
+                          output.dir = output.dir)
+      
+    }
+  }
+  
+  # contruct MCMC array
+  ConstructMCMCArray(ChainIDs = ChainNums,data.raw = data.raw)
+  
+  # Get estimates
+  IGPests(data.raw=data.raw,
+          interval = interval,
+          incl.errbounds = incl.errbounds)
+  
+} 
+
+
+#-----------------------------------------------------
+InternalRunOneChain <- function(#Do MCMC sampling
+  ###Do MCMC sampling for one chain
+  chainNum, ##<< Chain ID
+  jags.data,
+  jags.pars,
+  n.burnin,
+  n.iter,
+  n.thin,
+  output.dir,
+  model.file
+){
+  # set seed before sampling the initial values
+  set.seed.chain <- chainNum*209846
+  # mcmc.info <- list(set.seed.chain = set.seed.chain, chainNum = chainNum)
+  # mcmc.info.file <- file.path(mcmc.meta$general$output.dir, paste0("mcmc.info", filename.append, ".", chainNum, ".rda"))
+  # save(mcmc.info, file = mcmc.info.file)
+  dir.create(paste0(output.dir, "/temp.JAGSobjects/"),showWarnings=FALSE)
+  jags.dir <- file.path(output.dir, "temp.JAGSobjects/")
+  set.seed(set.seed.chain)
+  temp <- rnorm(1)
+  
+  mod<-suppressWarnings(jags(data=jags.data,
+                             parameters.to.save=jags.pars,
+                             model.file=model.file,
+                             n.chains=1,
+                             n.iter=n.iter,
+                             n.burnin=n.burnin,
+                             n.thin=n.thin,
+                             DIC=FALSE,
+                             jags.seed = set.seed.chain))
+  
+  mod.upd <- mod
+  save(mod.upd, file=file.path(output.dir, "temp.JAGSobjects", paste0("jags_mod", chainNum, ".Rdata")))
+  cat(paste("MCMC results", " for chain ", chainNum, " written to folder temp.JAGSobjects in ", output.dir), "\n")
+  
+  
+  cat(paste("Hooraah, Chain", chainNum, "has finished!"), "\n")
+  return(invisible())
+}
+
+
+
+================================================
+FILE: R/Get_diagnostics.R
+================================================
+
+
+get_diagnostics<-function(data.raw,output.dir="modeloutput/")
+{
+  dataname<-data.raw$dataname
+  load(paste0(output.dir,dataname,"/mcmc.array.rda"))
+     
+  pars.check=c("p","sigma.g","beta0")
+  # Get gelman diagnostics (Rhat threshold = 1.1)
+  # If gelman diagnostic fails then stop!
+    gd<-gr_diag(mcmc.array,pars.check = pars.check)
+    if(gd==-1)
+    {
+      cat("WARNING! Convergence issues, check trace plots \n")
+    
+    return(pars.check=pars.check)
+    }
+  # If gelman diagnostic passes then get other diagnostics  
+    if(gd==0)
+    {
+    eff_size(mcmc.array,pars.check = pars.check)
+    mcse(mcmc.array,pars.check = pars.check)
+    
+    return(list(pars.checked=pars.check))
+    }
+  
+  
+}
+
+
+
+================================================
+FILE: R/readMCMC.R
+================================================
+#--------------------------------------------------------------------------
+#--------------------------------------------------------------------------
+ConstructMCMCArray <- function(# Read in JAGS objects
+  ###  Read in JAGS objects and constructs \code{mcmc.array}, 
+  ### which is saved to \code{output.dir}.
+  ### This function can only be run after finising the mcmc sampling (after function \code{\link{RunMCMC}} has completed).
+  ChainIDs = ChainNums, ##<< Optional: specify which chains to include
+  ## (to use when you want to exclude a chain that crashed, or which has not finished yet).
+  n.samplestot.max = 15000, ##<< Maximum number of posterior samples to save
+  output.dir = NULL, ##<< Directory where MCMC output was stored and will be stored. 
+  core.run=FALSE,
+  data.raw
+){
+  
+  dataname<-data.raw$dataname
+  
+  if (is.null(output.dir)){
+    output.dir<-file.path(paste0("modeloutput/",dataname))
+  }
+  
+  # now combine the JAGS files into one mcmc.array
+  n.chains <- length(ChainIDs)
+  if (n.chains==1){
+    cat("You need at least two chains!\n")
+    return()
+  }
+  jags.dir <- file.path(output.dir, "temp.JAGSobjects/")
+  
+  cat("Reading in JAGS output files from", jags.dir, "\n")
+  chain  <- ifelse(length(ChainIDs)==1,ChainIDs,ChainIDs[1])
+  load(file.path(jags.dir, paste0("jags_mod", chain, ".Rdata"))) 
+  n.sim <- dim(mod.upd$BUGSoutput$sims.array)[1]
+  n.par <- dim(mod.upd$BUGSoutput$sims.array)[3]
+  mcmc.array <- array(NA, c(n.sim, n.chains, n.par))
+  dimnames(mcmc.array) <- list(NULL, NULL, names(mod.upd$BUGSoutput$sims.array[1,1,]))
+  for (chain in 1:n.chains){
+    chain_saved <- ifelse(length(ChainIDs)==1,1,ChainIDs[chain])
+    cat(paste("Reading in chain number ", chain_saved, sep = ""), "\n")
+    load(file.path(output.dir, "temp.JAGSobjects", paste0("jags_mod", chain_saved, ".Rdata"))) 
+    mcmc.array[1:n.sim,chain, ] = mod.upd$BUGSoutput$sims.array[,1,]
+    
+  }
+
+  if (n.sim > n.samplestot.max){
+    mcmc.array <- mcmc.array[seq(1, n.sample.max, length.out = n.sample.max), , ]  
+  }
+  
+  if(!core.run)
+  save(mcmc.array, file = file.path(output.dir, paste0("mcmc.array", ".rda"))) 
+  if(core.run)
+  save(mcmc.array, file = file.path(output.dir, paste0("mcmc.array.core", ".rda"))) 
+  
+  cat("mcmc.array saved to", output.dir, "\n")
+  
+  
+
+  return(invisible())
+}
+#----------------------------------------------------------------------   
+# The End!
+
+
+
+================================================
+FILE: R/.Rapp.history
+================================================
+
+

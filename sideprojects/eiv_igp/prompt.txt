@@ -1,0 +1,740 @@
+# 24 feb
+
+I'm trying to convert the R code into python with jax+numpyro instead of R+jags.
+
+The code is adapted from the paper that used EIV-IGP. I have python code for EIV GP, but i want to place the GP prior on the rate and integrate it, like done in the paper and the code. I'm thinking jax's odeint would be better suited instead of chebyshev-gauss quadrature, and play better with gradient evaluation required for HMC MCMC like NUTS.
+
+Can you help me with this? Think carefully and deeply on how i can implement the updated python version.
+
+My gp python implementation:
+
+import arviz as az
+import jax.numpy as jnp
+import matplotlib.pyplot as plt
+import numpy as np
+import numpyro
+import numpyro.distributions as dist
+import pandas as pd
+from jax import random
+import jax
+from numpyro.infer import MCMC, NUTS, Predictive
+from scipy.spatial.distance import cdist
+import time
+import seaborn as sns
+from tinygp import kernels, GaussianProcess
+jax.config.update("jax_enable_x64", True)
+df = pd.read_csv("./NYC.csv")
+
+def standardize_with_uncertainties(x: pd.Series, x_error: pd.Series):
+"""Standardize both values and their uncertainties"""
+x_std = x.std()
+x_mean = x.mean()
+# For the main values: (x - mean) / std
+x_standardized = ((x - x_mean) / x_std).to_numpy()
+# For uncertainties: only divide by std (don't subtract mean)
+x_error_standardized = (x_error / x_std).to_numpy()
+return x_standardized, x_error_standardized
+x, x_err = standardize_with_uncertainties(df["Age"] / 1000, df["AgeError"] / 1000)
+y, y_err = standardize_with_uncertainties(df["RSL"], df["RSLError"])
+test_x = np.linspace(x.min(), x.max(), 100)
+jitter = numpyro.sample(
+"jitter", dist.HalfNormal(1)
+) # similar to microscale variance mentioned in paper
+# scale = numpyro.sample("sigma", dist.HalfNormal(1))
+p = numpyro.sample("p", dist.Uniform(0, 1))
+# kernel = kernels.ExpSquared(scale)
+kernel = PoweredExponential(p=p, kappa=1.99)
+chi = numpyro.sample(
+"chi", dist.Normal(jnp.mean(x), jnp.std(x)), sample_shape=(len(x),)
+)
+gp = GaussianProcess(kernel, chi, diag=y_err\*\*2 + jitter)
+numpyro.sample("gp", gp.numpyro_dist(), obs=y)
+numpyro.sample("x_obs", dist.Normal(chi, x_err), obs=x)
+if y is not None:
+conditioned_gp = gp.condition(y, test_x).gp
+numpyro.deterministic("pred", conditioned_gp.loc)
+mcmc = MCMC(
+NUTS(eiv_gp_model, dense_mass=True, target_accept_prob=0.9),
+num_warmup=1000,
+num_samples=1000,
+)
+mcmc.run(jax.random.PRNGKey(0), x=x, y=y, x_err=x_err, y_err=y_err, test_x=test_x)
+mcmc.print_summary()
+
+
+And actually maybe diffrax may be more helpful for the integration? I'm open to ideas. This is the diffrax readme:
+Diffrax is a JAX-based library providing numerical differential equation solvers.
+Features include:
+ODE/SDE/CDE (ordinary/stochastic/controlled) solvers;
+lots of different solvers (including Tsit5, Dopri8, symplectic solvers, implicit solvers);
+vmappable everything (including the region of integration);
+using a PyTree as the state;
+dense solutions;
+multiple adjoint methods for backpropagation;
+support for neural differential equations.
+
+From a technical point of view, the internal structure of the library is pretty cool -- all kinds of equations (ODEs, SDEs, CDEs) are solved in a unified way (rather than being treated separately), producing a small tightly-written library.
+
+Quick example
+from diffrax import diffeqsolve, ODETerm, Dopri5import jax.numpy as jnpdef f(t, y, args):
+
+return -yterm = ODETerm(f)solver = Dopri5()y0 = jnp.array([2., 3.])solution = diffeqsolve(term, solver, t0=0, t1=1, dt0=0.1, y0=y0)
+Here, Dopri5 refers to the Dormand--Prince 5(4) numerical differential equation solver, which is a standard choice for many problems.
+
+Here is the R code that is from the original paper:
+
+dataprep <- function(data_path = NULL,
+                     dataname = "RSL Record",
+                     GIA = FALSE,
+                     rate.gia = NULL,
+                     yocc = 2010,
+                     BP_age_scale = FALSE) {
+  #### Create Directories
+  dir.create("fig", showWarnings = FALSE)
+  dir.create(paste0("fig/", dataname), showWarnings = F)
+
+  ## read in data and make any necessary changes
+  data <- read_csv(data_path,
+    col_types = cols()
+  )
+  names(data)[grepl("AgeError", names(data))] <- "AgeError"
+  names(data)[grepl("RSLError", names(data))] <- "RSLError"
+
+  ######## Set up the data########
+  GIA <- rep(GIA, nrow(data))
+  BP <- rep(BP_age_scale, nrow(data))
+
+  data <- data %>%
+    mutate(
+      x = ifelse(BP == FALSE, Age, 1950 - Age),
+      x_thousand = x / 1000,
+      y = ifelse(GIA == FALSE, RSL, (((yocc / 1000) - x_thousand) * rate.gia) + RSL),
+      var_x = (AgeError / 1000)^2,
+      var_y = RSLError^2,
+      x_lwr = x - AgeError,
+      x_upr = x + AgeError,
+      y_lwr = RSL - RSLError,
+      y_upr = RSL + RSLError,
+      y_1_lwr = ifelse(GIA == FALSE, y - RSLError, (((yocc / 1000) - x_upr / 1000) * rate.gia) + y_lwr),
+      y_2_lwr = ifelse(GIA == FALSE, y - RSLError, (((yocc / 1000) - x_lwr / 1000) * rate.gia) + y_lwr),
+      y_3_upr = ifelse(GIA == FALSE, y + RSLError, (((yocc / 1000) - x_lwr / 1000) * rate.gia) + y_upr),
+      y_4_upr = ifelse(GIA == FALSE, y + RSLError, (((yocc / 1000) - x_upr / 1000) * rate.gia) + y_upr),
+      x_1_upr = x + AgeError,
+      x_2_lwr = x - AgeError,
+      x_3_lwr = x - AgeError,
+      x_4_upr = x + AgeError
+    )
+
+  ######## Setting up the covariance and precision matrices#######
+  N <- nrow(data)
+  # this is wrong, right? there is an extra varx^2
+  V22 <- ifelse(GIA == FALSE, data$var_y, (((rate.gia^2) * data$var_x) + data$var_y) + data$var_x)
+  V12 <- ifelse(GIA == FALSE, 0, -rate.gia * data$var_x)
+  V21 <- ifelse(GIA == FALSE, 0, -rate.gia * data$var_x)
+  V11 <- data %>% pull(var_x)
+  V <- array(NA, c(2, 2, nrow(data)))
+  P <- array(NA, c(2, 2, nrow(data)))
+  for (i in 1:N)
+  {
+    V[, , i] <- matrix(c(V11[i], V12[i], V21[i], V22[i]), 2, 2)
+    P[, , i] <- solve(V[, , i])
+  }
+
+  get_bounds <- data %>%
+    select(y_1_lwr:x_4_upr) %>%
+    mutate(obs_index = 1:n()) %>%
+    pivot_longer(
+      cols = y_1_lwr:x_4_upr,
+      names_to = "bounds",
+      values_to = "value"
+    ) %>%
+    mutate(
+      bounds = replace(bounds, bounds %in% c("y_1_lwr", "y_2_lwr", "y_3_upr", "y_4_upr"), "y"),
+      bounds = replace(bounds, bounds %in% c("x_1_upr", "x_2_lwr", "x_3_lwr", "x_4_upr"), "x")
+    )
+
+  x_bounds <- get_bounds %>%
+    filter(bounds == "x")
+
+  y_bounds <- get_bounds %>%
+    filter(bounds == "y")
+
+  data_to_plot <- tibble(
+    obs_index = x_bounds$obs_index,
+    x = ifelse(rep(BP_age_scale, nrow(x_bounds)) == FALSE, x_bounds$value, 1950 - x_bounds$value),
+    y = y_bounds$value
+  )
+
+
+  p <- ggplot(data_to_plot, aes(x = x, y = y)) +
+    geom_polygon(aes(group = obs_index), alpha = 0.3) +
+    geom_point(data = data, aes(x = Age, y = y), alpha = 0.6, pch = 1) +
+    ylab(ifelse(GIA == FALSE, "Relative Sea Level (m)", "Sea Level (m)")) +
+    xlab(ifelse(BP_age_scale == FALSE, "Year CE", "Year BP")) +
+    ggtitle(ifelse(GIA == FALSE, "RSL Reconstruction", "SL Reconstruction")) +
+    theme_classic()
+
+  if (BP_age_scale == TRUE) {
+    p <- p + scale_x_reverse()
+  }
+
+  suppressMessages(ggsave(paste0("fig/", dataname, "/", "Raw Data", ifelse(GIA[1] == FALSE, "", "(GIA corrected)"), ".pdf", sep = ""), p, width = 7, height = 4))
+  cat("Plots of data saved to fig folder", "\n")
+
+
+  return(list(
+    data = data,
+    data_to_plot = data_to_plot,
+    P = P,
+    dataname = dataname,
+    GIA = GIA[1],
+    BP_age_scale = BP_age_scale
+  ))
+}
+
+
+IGPdata <- function(data.raw = NULL,
+                    year1 = NULL,
+                    year2 = NULL,
+                    interval = 25,
+                    html.file = NULL,
+                    incl.errbounds = TRUE,
+                    upper = NULL,
+                    lower = NULL) {
+  data <- data.raw$data
+
+  ############# Set up the grid for the GP ###################
+  nw <- 30 # Sets the min number of grid points for the derivative
+  if (incl.errbounds) {
+    up <- max(data$x_upr) / 1000
+    low <- min(data$x_lwr) / 1000
+    xgrid <- c(low, seq(min(data$x_thousand), max(data$x_thousand), by = (interval / 1000)), up)
+  } else {
+    up <- ifelse(is.null(upper), max(data$x_thousand), upper)
+    low <- ifelse(is.null(lower), min(data$x_thousand), lower)
+    xgrid <- c(seq(min(data$x_thousand), max(data$x_thousand), by = (interval / 1000)))
+    Ngrid <- length(xgrid)
+  }
+  Ngrid <- length(xgrid)
+
+  if (Ngrid < nw) {
+    stop("Grid length must be at least 30")
+  } else {
+    cat(paste0("Using a grid size of", " ", Ngrid, " ", "and an interval width of", " ", interval, " ", "years \n"))
+  }
+
+  ### Change data to lower zero for integration
+  minx <- min(data$x_thousand)
+  x <- data$x_thousand - minx
+  # xgrid is just np.arange(xmin, xmax, interval)
+  # xstart is normalised xgrid
+  xstar <- xgrid - minx
+
+  # euclidean dist matrix (same as absolute dist for 1d)
+  Dist <- rdist(xstar) ### Distance matrix required for the model
+  D <- cbind(x, data$y) ### Combine the x,y data for the model
+
+  ######## Initialize quadrature for the integration########
+  N <- nrow(data)
+  L <- 30 ## this sets the precision of the integration quadrature (higher is better but more computationally expensive)
+  index <- 1:L
+
+  # roots of the chebyshev polynomial of the first kind
+  cosfunc <- cos(((2 * index - 1) * pi) / (2 * L))
+
+  quad1 <- array(dim = c(nrow = N, ncol = Ngrid, L))
+  quad2 <- array(dim = c(nrow = N, ncol = Ngrid, L))
+
+  for (j in 1:Ngrid)
+  {
+    for (k in 1:N)
+    {
+      # This is computing the powered exponential covariance function
+      quad1[k, j, ] <- abs((x[k] * cosfunc / 2) + (x[k] / 2) - xstar[j])^1.99
+      # quadrature weights
+      quad2[k, j, ] <- ((x[k] / 2) * (pi / L)) * (sqrt(1 - cosfunc^2))
+    }
+  }
+
+  P <- data.raw$P
+
+  return(list(
+    year.grid = xgrid * 1000,
+    xstar = xstar,
+    N = N,
+    Ngrid = Ngrid,
+    D = D,
+    P = P,
+    Dist = Dist,
+    quad1 = quad1,
+    quad2 = quad2,
+    cosfunc = cosfunc,
+    ppi = pi,
+    L = L,
+    incl.errbounds = incl.errbounds,
+    interval = interval,
+    BP_age_scale = data.raw$BP_age_scale
+  ))
+}
+RunIGPModel <- function(data.raw = NULL,
+                        cor.p = 0.2,
+                        n.iter = 25000,
+                        n.burnin = 5000,
+                        n.thin = 10,
+                        ChainNums = seq(1, 2),
+                        fast = FALSE,
+                        run.on.server = FALSE,
+                        incl.errbounds = TRUE,
+                        interval = 25) {
+  # Create a directory "modeloutput" in current working directory
+  dataname <- data.raw$dataname
+  dir.create("modeloutput", showWarnings = FALSE)
+  dir.create(paste0("modeloutput/", dataname), showWarnings = F)
+  output.dir <- file.path(paste0("modeloutput/", dataname))
+
+  # Get model data
+  modeldat <- IGPdata(
+    data.raw = data.raw,
+    interval = interval,
+    incl.errbounds = incl.errbounds
+  )
+
+  ### The necessary data
+  jags.data <- list(
+    n = modeldat$N, # number of data points
+    m = modeldat$Ngrid, # length of xgrid/xstar
+    P = modeldat$P, # precision matrices (2,2,n)
+    D = modeldat$D, # (n,2), first col is (x_th-min(x_th)), second is rsl in meters
+    L = modeldat$L, # 30 : precision of integration quadrature
+    ppi = modeldat$ppi, # pi=3.14?
+    cosfunc = modeldat$cosfunc, # roots of chebyshev polynomial for evaluation
+    Dist = modeldat$Dist, # euclidean distance matrix between all normalised x(age) vals
+    xstar = modeldat$xstar, # np.arange(xmin, xmax,interval)-xmin
+    quad1 = modeldat$quad1, # precomputed things for chebyshev-gauss integration
+    quad2 = modeldat$quad2,
+    kappa = 1.99, # powered exponential pwr
+    cor.p = cor.p # 0.2?
+  )
+
+  ### Paramaters to save
+  jags.pars <- c(
+    "beta0",
+    "sigma.g",
+    "p",
+    "w.m",
+    "mu",
+    "sigma.y",
+    "K.w.inv"
+  )
+
+  ######## Run the model########
+  if (fast) {
+    model.file <- "model/EIVIGPfast.txt"
+  }
+
+  if (!fast) {
+    model.file <- "model/EIVIGP.txt"
+  }
+
+
+  if (run.on.server) {
+    foreach(chainNum = ChainNums) %dopar% {
+      cat(paste("Start chain ID ", chainNum), "\n")
+
+      InternalRunOneChain(
+        chainNum = chainNum,
+        jags.data = jags.data,
+        jags.pars = jags.pars,
+        n.burnin = n.burnin,
+        n.iter = n.iter,
+        n.thin = n.thin,
+        model.file = model.file,
+        output.dir = output.dir
+      )
+    } # end chainNums
+  } else {
+    for (chainNum in ChainNums) {
+      cat(paste("Start chain ID ", chainNum), "\n")
+
+      InternalRunOneChain(
+        chainNum = chainNum,
+        jags.data = jags.data,
+        jags.pars = jags.pars,
+        n.burnin = n.burnin,
+        n.iter = n.iter,
+        n.thin = n.thin,
+        model.file = model.file,
+        output.dir = output.dir
+      )
+    }
+  }
+
+  # contruct MCMC array
+  ConstructMCMCArray(ChainIDs = ChainNums, data.raw = data.raw)
+
+  # Get estimates
+  IGPests(
+    data.raw = data.raw,
+    interval = interval,
+    incl.errbounds = incl.errbounds
+  )
+}
+
+
+#-----------------------------------------------------
+InternalRunOneChain <- function(
+    # Do MCMC sampling
+    ### Do MCMC sampling for one chain
+    chainNum, ## << Chain ID
+    jags.data,
+    jags.pars,
+    n.burnin,
+    n.iter,
+    n.thin,
+    output.dir,
+    model.file) {
+  # set seed before sampling the initial values
+  set.seed.chain <- chainNum * 209846
+  # mcmc.info <- list(set.seed.chain = set.seed.chain, chainNum = chainNum)
+  # mcmc.info.file <- file.path(mcmc.meta$general$output.dir, paste0("mcmc.info", filename.append, ".", chainNum, ".rda"))
+  # save(mcmc.info, file = mcmc.info.file)
+  dir.create(paste0(output.dir, "/temp.JAGSobjects/"), showWarnings = FALSE)
+  jags.dir <- file.path(output.dir, "temp.JAGSobjects/")
+  set.seed(set.seed.chain)
+  temp <- rnorm(1)
+
+  mod <- suppressWarnings(jags(
+    data = jags.data,
+    parameters.to.save = jags.pars,
+    model.file = model.file,
+    n.chains = 1,
+    n.iter = n.iter,
+    n.burnin = n.burnin,
+    n.thin = n.thin,
+    DIC = FALSE,
+    jags.seed = set.seed.chain
+  ))
+
+  mod.upd <- mod
+  save(mod.upd, file = file.path(output.dir, "temp.JAGSobjects", paste0("jags_mod", chainNum, ".Rdata")))
+  cat(paste("MCMC results", " for chain ", chainNum, " written to folder temp.JAGSobjects in ", output.dir), "\n")
+
+
+  cat(paste("Hooraah, Chain", chainNum, "has finished!"), "\n")
+  return(invisible())
+}
+GetIGPRes<-function(data.raw=NULL,
+                    interval = 25)
+{
+
+  dir.create("results", showWarnings = FALSE)
+  dir.create(paste0("results/",data.raw$dataname),showWarnings = F)
+  
+  GIA <- data.raw$GIA
+  BP <- data.raw$BP_age_scale
+  
+  load(paste0("modeloutput/",data.raw$dataname,"/EstsandRates.rda"))
+  
+  modeldat <- IGPdata(data.raw = data.raw,
+                      interval = interval,
+                      incl.errbounds = EstsandRates$incl.errbounds)
+  
+
+  
+  pred_s <- suppressWarnings(as_tibble(EstsandRates$pred) %>% 
+              rename_at(vars(everything()),~ as.character(modeldat$year.grid)) %>% 
+              pivot_longer(everything(),names_to = "year") %>% 
+              mutate(year = as.numeric(year)))
+  SLestimates <- pred_s %>% 
+                  group_by(year) %>% 
+                  summarise(SL_est = mean(value),
+                            SL_lwr = mean(value) - 2*(sd(value)),
+                            SL_upr = mean(value) + 2*(sd(value))) %>% 
+                  mutate(year = ifelse(rep(data.raw$BP_age_scale,length(SL_est)) == FALSE, year, 1950 - year))
+  
+  dydt_s <- suppressWarnings(as_tibble(EstsandRates$dydt) %>% 
+            rename_at(vars(everything()),~ as.character(modeldat$year.grid)) %>% 
+            pivot_longer(everything(),names_to = "year") %>% 
+            mutate(year = as.numeric(year)))
+
+  SLrates <- dydt_s %>% 
+             group_by(year) %>% 
+             summarise(rate_est = mean(value),
+                       rate_lwr = mean(value) - 2*(sd(value)),
+                       rate_upr = mean(value) + 2*(sd(value))) %>% 
+             mutate(year = ifelse(rep(data.raw$BP_age_scale,length(rate_est)) == FALSE, year, 1950 - year))
+  
+  rate_mean <- mean(dydt_s$value)
+  rate_mean_lwr <- quantile(dydt_s$value,probs = 0.025)
+  rate_mean_upr <- quantile(dydt_s$value,probs = 0.975)
+  
+  write.csv(SLestimates,file=paste0("results/",data.raw$dataname,"/",ifelse(data.raw$GIA == FALSE,"RSL_Estimates.csv", "SL_Estimates.csv")))
+  write.csv(SLrates,file=paste0("results/",data.raw$dataname,"/",ifelse(data.raw$GIA == FALSE, "RSL_Rates.csv","SL_Rates.csv")))
+  cat(paste0("Spreadsheets containing ", ifelse(data.raw$GIA == FALSE, "RSL estimates ","GIA Corrected SL estimates "),"and rates for"," ",data.raw$dataname," ", "are saved in results folder","\n"))
+
+  return(list(SLestimates = SLestimates,
+              SLrates = SLrates, 
+              modeldat = modeldat,
+              rate_mean = rate_mean,
+              rate_mean_lwr = rate_mean_lwr,
+              rate_mean_upr = rate_mean_upr))
+}
+
+IGPResults<-function(data.raw=NULL,
+                   interval = 25,
+                   xlimits=NULL,
+                   ylimits=NULL,
+                   ratelimits=NULL)
+{
+
+
+  model_res <- GetIGPRes(data.raw=data.raw,
+                         interval = interval)
+  modeldat <- model_res$modeldat
+  
+  sl_dat <- model_res$SLestimates
+  rate_dat <- model_res$SLrates
+  data_to_plot <- data.raw$data_to_plot
+  
+  p1 <- ggplot(sl_dat, aes(x = year, y = SL_est))+
+    geom_line() +
+    geom_ribbon(aes(x = year, ymin = SL_lwr, ymax = SL_upr), alpha = 0.5) +
+    geom_polygon(data = data_to_plot, aes(x = x, y = y,group = obs_index),alpha = 0.1) + 
+    ylab(ifelse(data.raw$GIA == FALSE, "Relative Sea Level (m)", "Sea Level (m)")) +
+    xlab(ifelse(data.raw$BP_age_scale == FALSE,"Year CE","Year BP")) + 
+    ggtitle(ifelse(data.raw$GIA == FALSE,"RSL Estimates","SL Estimates")) + 
+    theme_classic()
+  
+  suppressMessages(ggsave(paste0("fig/",data.raw$dataname,"/","Results_SL Estimates", ifelse(data.raw$GIA == FALSE,"","(GIA corrected)"),".pdf", sep = ""),p1, width = 7, height = 4))
+  
+  p2 <- ggplot(rate_dat, aes(x = year, y = rate_est))+
+    geom_line() +
+    geom_ribbon(aes(x = year, ymin = rate_lwr, ymax = rate_upr), alpha = 0.5) +
+    ylab(ifelse(data.raw$GIA == FALSE, "Rate of RSL Change (mm/yr)", "Rate of SL Change (mm/yr)")) +
+    xlab(ifelse(data.raw$BP_age_scale == FALSE,"Year CE","Year BP")) + 
+    ggtitle(ifelse(data.raw$GIA == FALSE,"RSL Rates","SL Rates")) + 
+    theme_classic()
+  
+  suppressMessages(ggsave(paste0("fig/",data.raw$dataname,"/","Results_Rate Estimates", ifelse(data.raw$GIA == FALSE,"","(GIA corrected)"),".pdf", sep = ""),p2, width = 7, height = 4))
+  
+  cat("Plots of estimates and rates saved in fig folder \n")
+  
+  return(list(mean_rate = model_res$rate_mean, 
+              mean_rate_lwr = model_res$rate_mean_lwr,
+              mean_rate_upr = model_res$rate_mean_upr))
+}
+### Clear workspace###
+rm(list = ls())
+
+### Required Packages and Libraries ###
+## uncomment the install.packages if these packages aren't already installed ###
+# install.packages(c("rjags","R2jags","fields","tidyverse))
+library(rjags)
+library(R2jags)
+library(fields)
+library(tidyverse)
+##############################################################
+
+### Load the required R functions ###
+Rfiles <- list.files(file.path(getwd(), "R"))
+Rfiles <- Rfiles[grepl(".R", Rfiles)]
+sapply(paste0("R/", Rfiles), source)
+
+### An example of the correct format for the data is shown for New Jersey
+## Do not change the headings (RSL,RSLError,Age,AgeError)
+## Errors must be 1sigma
+## If Age is given in the BP scale, change the BP_age_scale argument to TRUE in the dataprep() function below
+
+### Prepare the data for the model ###
+## User to input the data file location and the name of their dataset e.g., dataname = "New York"
+## Plot of the raw data will be saved to fig folder
+data.raw <- dataprep(
+    data_path = "data/NYC.csv",
+    dataname = "newyork",
+    BP_age_scale = FALSE
+)
+
+## NOTE!!! If correcting for GIA change GIA = TRUE and provide a rate of GIA in mm/yr
+
+### Run the model ###
+## User to provide the interval for how often they want predictions from the model
+interval <- 30
+
+## run
+RunIGPModel(
+    data.raw = data.raw,
+    interval = interval,
+    fast = FALSE,
+    ChainNums = seq(1, 1)
+)
+
+## Check convergence for GP parameters
+## Note: this won't work if fast = TRUE
+get_diagnostics(data.raw = data.raw)
+
+### Output the model figures and results ###
+## Figures will output to fig folder
+## .csv file will output to results folder
+IGPResults(
+    data.raw = data.raw,
+    interval = interval
+)
+
+From the paper:
+
+MODELING SEA-LEVEL CHANGE USING ERRORS-IN-VARIABLES INTEGRATED GAUSSIAN PROCESSES1
+BY NIAMH CAHILL∗, ANDREW C. KEMP†, BENJAMIN P. HORTON‡,
+We perform Bayesian inference on historical and late Holocene (last 2000 years) rates of sea-level change. The input data to our model are tide- gauge measurements and proxy reconstructions from cores of coastal sedi- ment. These data are complicated by multiple sources of uncertainty, some of which arise as part of the data collection exercise. Notably, the proxy recon- structions include temporal uncertainty from dating of the sediment core us- ing techniques such as radiocarbon. The model we propose places a Gaussian process prior on the rate of sea-level change, which is then integrated and set in an errors-in-variables framework to take account of age uncertainty. The resulting model captures the continuous and dynamic evolution of sea-level change with full consideration of all sources of uncertainty. We demonstrate the performance of our model using two real (and previously published) ex- ample data sets. The global tide-gauge data set indicates that sea-level rise increased from a rate with a posterior mean of 1.13 mm/yr in 1880 AD (0.89 to 1.28 mm/yr 95% credible interval for the posterior mean) to a posterior mean rate of 1.92 mm/yr in 2009 AD (1.84 to 2.03 mm/yr 95% credible in- terval for the posterior mean). The proxy reconstruction from North Carolina (USA) after correction for land-level change shows the 2000 AD rate of rise to have a posterior mean of 2.44 mm/yr (1.91 to 3.01 mm/yr 95% credible interval). This is unprecedented in at least the last 2000 years.
+1. Introduction. Sea-level rise poses a hazard to the intense concentrations of population and infrastructure that are increasingly located at the coast [Nicholls and Cazenave (2010)]. Effective mitigation and management of this hazard is re- liant upon accurate estimation of historic, current, and future rates of sea-level rise. Data for estimating such rates come from instrumental measurements (tide gauges and satellites) and proxy reconstructions (derived from a wide variety of
+ 
+palaeoenvironmental data including stratigraphical, biological, geochemical, and archaeological data). Instrumental data are more precise, but span the relatively short historic time period. Proxy reconstructions are less precise, but cover a much longer time interval. We use examples of both types of data to estimate rates of sea-level change with thorough quantification of uncertainty.
+The instrumental data we use provides a historic time series of fixed and known ages with estimated sea levels and associated measurement errors. Al- though there are now ∼2000 operational tide gauges worldwide [Jevrejeva et al. (2006), Woodworth and Player (2003)] that are located along coastlines and is- lands, most were installed since the 1950s. Therefore, global compilations rely on fewer gauges further back in time. The most widely used global tide-gauge com- pilation spans the period since 1880 AD [Church and White (2011)]. Since late 1992 AD, satellite altimetry measurements have further provided a global record of sea-level change [Cazenave and Llovel (2010), Nerem et al. (2010)]. Church and White (2011) demonstrate that there is good agreement (within uncertainty bounds) between their global mean sea-level (GMSL) record based on tide gauges and satellite altimetry measurements over the period from 1993 AD to 2009 AD. Thus, we use only the tide-gauge data as our instrumental record.
+Proxy data provide sea-level reconstructions spanning hundreds to millions of years. Here we use late Holocene (last 2000 years) data to place modern rates of sea-level change in an appropriate context and characterize the relationship be- tween climate and sea level. In our case study, we use proxy data that were pre- processed from their raw form (counts of species preserved within cores of coastal sediment) into estimates of sea level. We do not explore the preprocessing in this paper; see Birks (1995), Horton and Edwards (2006), Juggins and Birks (2012) for a discussion of how this was done. The resulting processed data are comprised of sea-level estimates that are irregularly spaced in time and have uncertain ages in addition to sea-level uncertainties.
+Instrumental and proxy reconstructions both estimate relative sea level (RSL), which is the product of simultaneous land- and ocean-level changes. In the absence of tectonics, land-level changes primarily arise from the ongoing, slow rebound of the solid Earth to deglaciation [Peltier (2004)], which is called glacio-isostatic adjustment (GIA). Regions that were under the thickest ice at the last glacial max- imum (between 26,000 and 19,000 years ago) are experiencing uplift (RSL fall), while areas that were peripheral to the ice sheet are experiencing subsidence (RSL rise). To compare sea-level measurements or reconstructions from different loca- tions and to isolate the climate-related component of sea-level change, it is neces- sary to estimate and remove the contribution from GIA [Engelhart et al. (2009)]. The global tide-gauge data set that we use in this paper was already corrected for GIA [Church and White (2011)], but we must correct the proxy reconstruc- tion. Since GIA is a rate (usually expressed in mm/yr), it affects older sediments more than younger sediments. This has repercussions for our model, because it in- troduces correlation between the individual age and sea-level reconstructions. We defer full discussion of this to Section 4.
+
+To accurately estimate the evolution of rates of sea-level change through time and reliably compare instrumental compilations with proxy reconstructions, it is necessary to account for the uncertainties that characterize each data set. Previous studies used simple linear regression models (most commonly polynomial regres- sion), resulting in overly precise rate estimates. We develop models to estimate rates of sea-level change and account for all available sources of uncertainty in instrumental and proxy-reconstruction data. Our response variable with the proxy measurements is sea level after correction for GIA. Our models place a Gaussian process (GP) prior on the rates of sea-level change and the mean of the distribution assumed for the observed data is the integral of this rate process. By embedding the integrated Gaussian process (IGP) model in an errors-in-variables (EIV) frame- work (which takes account of time uncertainty) and removing the estimate of GIA, we quantify rates with better estimates of uncertainty than was previously possible.
+To demonstrate the application of these models, we apply them to an example global tide-gauge data set [Church and White (2011)]. Our analysis of this record indicates that the rate of GMSL rise increased continuously since 1880 AD and the posterior estimate of the mean rate of sea-level in 2009 AD is 1.92 mm/yr. The 95% credible interval for this mean is 1.84 to 2.03 mm/yr. We also apply the model to a late Holocene proxy reconstruction from North Carolina [Kemp et al. (2011)]. Such reconstructions are important to understand the response of sea level to known climate variability such as the Medieval Climate Anomaly and the Little Ice Age [Mann et al. (2008)]. Application of our model to the North Carolina proxy reconstruction indicates a posterior mean rate of rise in this locality since the middle of the 19th century of 2.44 mm/yr. The 95% credible interval for this mean is 1.91 to 3.01 mm/yr. This result is in agreement with results from the tide- gauge analysis and illustrates that the current rate of sea level is unprecedented in at least the last 2000 years. The two examples show the importance and utility of the new models in estimating dynamic rates of sea-level change with full and formal consideration of the uncertainties that characterize instrumental and proxy data sets.
+2. Sea-level data sets. This section describes how the global tide-gauge record [Church and White (2011)] was compiled and how RSL in North Carolina was reconstructed using proxies preserved in cores of coastal sediment [Kemp et al. (2011)]. Although the methods for data collection are specific to our case studies, the resulting records are typical of available sea-level data sets.
+2.1. Tide gauges. Tide gauges are instruments that measure RSL multiple times each day at a fixed coastal location. Monthly RSL averages for individual locations are held by the Permanent Service for Mean Sea Level [Woodworth and Player (2003)]. The distribution of these locations is very uneven in time and space. To reliably estimate rates and trends against a background of annual to decadal variability, analysis of individual tide-gauge records is commonly restricted to
+
+locations with more than ∼60 years of data [Douglas, Kearney and Leatherman (2001)]. GMSL is estimated by spatially averaging tide-gauge records after indi- vidual records (irrespective of record length) were corrected for GIA. The most commonly used data set is that of Church and White (2011), which includes an- nual sea-level data between 1880 AD and 2009 AD from up to 235 individual lo- cations [Figure 1(A)]. This data set employed the spatial variability in sea level observed by satellites to interpolate between tide-gauge locations and estimate global sea level. Other studies produced alternative estimates of GMSL using dif- ferent methodologies to correct for GIA and to account for the uneven distribution of tide gauges in time and space [e.g., Hay et al. (2015), Jevrejeva et al. (2008)]. However, each of these compilations shared the basic attributes of the Church and White (2011) data set in having a fixed and known age, but estimated GMSL with uncertainty. Therefore, our choice of example data set is typical of tide-gauge data, but our model could also be appropriately applied to similar data sets and poten- tially yield different estimates of rates of historical sea-level change.
+2.2. Salt-marsh reconstructions. Salt marshes keep pace with sea-level rise by accumulating sediment [Morris et al. (2002)]. As a result, modern salt marshes may be underlain by several meters of sediment, which is an archive of past sea- level changes. Cores are used to recover this coastal sediment for analysis. The ages of discrete depths in the core are estimated using techniques such as radiocar- bon dating to provide a history of sediment accumulation. Radiocarbon dates are calibrated into calendar ages and assimilated with other chronological constraints (e.g., pollution markers of known age) using an age-depth model.
+For the North Carolina reconstruction [Figure 1(B)], ages for the RSL data were calculated from Bchron [Haslett and Parnell (2008), Parnell et al. (2008, 2011)], a Bayesian, statistical age-depth model that estimates uncertain interpolated ages between radiocarbon dated levels. This tool is particularly useful in reconstruct- ing RSL from a core of coastal sediment, because most levels in the core were not directly dated. Bchron assumes that the calibrated radiocarbon ages arise as realizations of a Compound Poisson–Gamma (CPG) process, which enforces the geological law of superposition. Bchron calibrates the radiocarbon dates, estimates the parameters of the CPG and identifies outliers. The ages and 1 sigma age errors used in the North Carolina proxy reconstruction are the Bchron marginal means and standard deviations for each layer in the core that was used to reconstruct RSL, which we approximate as being normally distributed. This would be a poor assumption for individual calibrated radiocarbon dates that are skewed and multi- modal. However, the CPG produces slightly more regular ages, and the effect is further reduced when combined with our smoothing approach.
+Core sediment contains the preserved remains of microorganisms such as foraminifera. The distribution of foraminifera is controlled by tidal elevation (i.e., sea level) because some species are more tolerant of submergence by the tides than others [Scott and Medioli (1978)]. The modern, observable relationship between
+
+                                                                                                             FIG. 1. (A) Global tide-gauge record of Church and White (2011). These global mean sea-level data are a compilation of individual tide-gauge records from sites located around the world that were individually corrected for the contribution of GIA. The data set is characterized by vertical (sea level) uncertainties (2 sigma uncertainty bands approximate the 95% confidence interval), but ages are fixed and known. (B) Proxy reconstruction of RSL from North Carolina, USA [Kemp et al. (2011)]. Individual data points (represented by rectangular boxes that illustrate the 95% confidence region) are unevenly distributed through time and include age and sea-level uncertainties. (C) The North Carolina reconstruction following correction for GIA.
+
+counts of foraminifera and sea level provides an analogy for interpreting similar assemblages preserved in core material. This analogy is exploited to reconstruct RSL using a transfer function [Birks (1995), Horton and Edwards (2006), Juggins and Birks (2012), Kemp et al. (2013)]. The calibration of counts of foraminifera into estimates of RSL (via these transfer functions) requires further statistical mod- eling techniques that we do not discuss here. The transfer function output returns an estimate of the error associated with each fossil sample. This is given by the root mean square error of prediction of a training set, derived using a separate test set, or by internal cross-validation. We include these error estimates, assumed to be 1 sigma uncertainties, as an input to our model. The validity of this approach was demonstrated by comparison between reconstructions and instrumental measure- ments from nearby tide gauges [e.g., Kemp et al. (2009)]. To extract climate-driven rates of sea-level rise, the RSL reconstructions are corrected for GIA, which over the last 2000 years is assumed to be a constant rate because of the slow response time of the solid Earth [Peltier (2004)]. The GIA corrected reconstruction for North Carolina is shown in Figure 1(C).
+3. Previous work. In this section we review how rates of sea-level change are estimated from uncertain data in existing literature. We also describe the stochastic methods that we employed in this paper.
+3.1. Sea-level rise: Rates and accelerations. The motivation for analyzing tide-gauge records and reconstructing RSL is to establish how unusual modern rates of sea-level rise are in comparison to longer term trends and for understand- ing the role of climate variability as a driver of sea-level change [e.g., Donnelly et al. (2004), Engelhart et al. (2009), Shennan and Horton (2002)]. Comparisons of past and present rates are only complete and fair if all sources of uncertainty are accounted for. The global tide-gauge record is the primary source of his- toric and current sea-level data. The record includes sea-level uncertainty that is greater earlier in the record because it is based on fewer individual records that are unevenly distributed in space with a bias toward western Europe and North America [Jevrejeva et al. (2008)]. The age of each annual sea-level observation is fixed and known. Tide-gauge records are commonly analyzed using simple lin- ear regression to estimate a rate of sea-level rise for the entire record or a shorter segment [e.g., Barnett (1984), Church and White (2006), Douglas, Kearney and Leatherman (2001), Gornitz, Lebedeff and Hansen (1982), Holgate and Wood- worth (2004), Jevrejeva et al. (2014), Peltier and Tushingham (1991), Sallenger, Doran and How’d (2012)]. For example, Church and White (2011) calculated the mean rate of global sea-level rise to be 1.6 mm/yr ± 0.3 mm from 1880 AD to 2009 AD compared to 1.1 mm/yr ± 0.7 mm between 1880 AD and 1936 AD, and 1.8 mm/yr ± 0.3 mm after 1936 AD. Satellite altimetry data have also been ana- lyzed in this way to estimate a rate of GMSL rise of 3.4 mm/yr ± 0.4 mm between 1993 AD and 2008 AD [Nerem et al. (2010)].
+
+Similar approaches were widely employed to characterize acceleration or decel- eration of sea-level rise, where a polynomial rather than linear function was fitted to the tide-gauge record [e.g., Boon (2012), Houston and Dean (2011), Jevrejeva et al. (2008), Woodworth et al. (2009)]. For example, Church and White (2011) estimated a sea-level acceleration of 0.009 mm/yr2 ± 0.003 mm/yr2 for the pe- riod 1880 AD to 2009 AD. In contrast, Houston and Dean (2011) obtained a small sea-level deceleration (−0.0123 ± 0.0104 mm/yr2) by selectively analyzing U.S. tide gauges from 1930 AD to 2010 AD and suggested similar decelerations for the global data set over the same time interval. A limitation of subdividing the tide- gauge record into segments identified by visual inspection is that individual data points are ascribed undue importance and information is lost in the autocorrelated data set by discarding earlier and/or later intervals. Furthermore, the estimated rates of change are sensitive to the data included, making comparisons among data sets difficult. For example, the rate of sea-level change measured by satellite al- timetry since 1993 AD is greater than the “current” (1936–2009 AD) rate often quoted from Church and White’s (2011) analysis of their global tide-gauge record. Although the estimated rates of change are different, Church and White empha- sized the agreement between the two methods of measuring sea-level change over the period where both data sources are available.
+In considering proxy reconstructions with bivariate uncertainties, some studies divided the data series into sections based on changes in slope that were qualita- tively positioned by the researcher at a single time point [e.g., Gehrels and Wood- worth (2013)]. Consequently, a rate of change was calculated for each segment of the sea-level reconstruction by simple linear regression of midpoints with no formal consideration of age and sea-level uncertainty or their covariance. Other studies used an EIV change point approach to objectively place changes in slope across a range of timings and to estimate linear rates for each segment with consid- eration of uncertainty [Kemp et al. (2011, 2013), Long et al. (2014)]. A limitation of this approach is that phases of persistent sea-level behavior are approximated by linear trends that do not accurately represent the underlying physics of sea-level change and mask (to some degree) the continuous evolution of sea level through time.
+3.2. Stochastic processes and rate estimation. The model we propose makes use of the EIV approach, where we do not assume that the explanatory variable (which we denote as x) is known, but that it is instead measured with some error [Dey, Ghosh and Mallick (2000)]. The EIV approach can be used with multivari- ate and hierarchical models including our application to proxy sea-level recon- structions with age and sea-level errors. We embed our EIV regression within a nonparametric model.
+We use a GP as a prior on the rate process, which is then integrated to esti- mate sea level. The opposite approach, where a GP is placed on the data itself and then differentiated to produce rates, has a long literature [Cramér and Leadbetter
+
+(1967), O’Hagan (1992)], both where the derivatives were observed and where they were estimated. A fuller description of GPs is found in Williams and Ras- mussen (1996) and Rasmussen and Williams (2006). Most recently in sea-level research, Kopp (2013) employed an empirical Bayesian analysis that used GPs to assess the statistical significance of the “hot spot” of sea-level acceleration in the mid-Atlantic and northeastern regions of the United States. Hay et al. (2015) use GPs for rate estimation and to assess the robustness of their probabilistic reanalysis of GMSL. However, GPs are not the only means for creating rate estimates. Other work exists in the field of splines [e.g., Chaniotis and Poulikakos (2004), Mardia et al. (1996)] or in diffusion processes and differential equation models [e.g., Liang and Wu (2008)].
+We do not cover spatio-temporal modeling of sea-level rates in this paper, focus- ing instead on individual sites. The behavior of sea level in space is highly irregular and relates to numerous physical features and processes that are beyond the range of the statistical models we discuss. We focus on a novel EIV-IGP approach. The GP has advantages over other methods mentioned previously due to its simplicity and flexibility despite using only a small number of parameters. The IGP we em- ploy is an inverse model where the GP is applied to the rate process rather than the observed data. Holsclaw et al. (2013) outline a method for posterior computation of such models which we employ in the next section.
+4. Methods. In this section we outline the EIV-IGP model used to estimate past sea level while accounting for age uncertainty. We apply this model to the North Carolina proxy reconstruction in Section 5. Our first case study (the global tide-gauge record) requires a slightly simplified version of this model (which we term S-IGP), because the data has fixed and known ages and, therefore, lacks age uncertainity. The raw data are scalars (yi,σyi ,xi,σxi ) for i = 1,...,n data points, where yi is the RSL measurement and σyi is the sample-specific estimate of uncer- tainty for the measurement which is one standard deviation, xi is the estimated age measurement from the chronology model, and σxi is the age standard deviation, also taken from the chronology model. Ignoring GIA correction for the moment, we can write
+(4.1) yi =α+h(χi)+εi, i=1,...,N,
+(4.2) xi =χi +δi, i=1,...,N,
+where the errors εi ∼ N (0, σy2 + τ 2 ) are independent and τ 2 is a micro-scale vari- i
+ance term. Modelers sometimes separate the micro-scale variation using η which captures the micro-scale variation and ε which captures the pure measurement error [Banerjee and Fuentes (2012)]. The methods used to reconstruct sea level, described in Section 2.2, assume that the distribution of microorganisms such as foraminifera is controlled by tidal elevation (i.e., sea level). However, foraminifera abundances are also affected by other sources of noise [e.g., influence of additional
+
+environmental variables such as salinity or sediment texture; Horton, Edwards and
+Lloyd (1999)]. As a result, it is necessary to include τ 2 in the model to account for
+any unexplained variation that may be present in the data. δi ∼ N (0, σx2 ), α is a i
+constant intercept parameter, h(χ) is a stochastic process in continuous time that represents the underlying evolution of RSL and χi is the true unobserved age for observation i. The mean of the distribution for the observed data is dependent on the stochastic process that we want to estimate and the model is set up to have a classical EIV structure. The key parameters are those in h and the micro-scale variance τ2. The estimated true ages χi are nuisance parameters. Our focus lies in posterior inference about h and, most importantly, its derivative.
+As discussed in Section 3.2, there are numerous nonparametric priors on func-
+tions that provide stochastic derivatives, though our situation is complicated by the
+inclusion of age uncertainties. If the data were modeled with a GP, we would write
+yi = α + g(χi) + εi, where g(χi) is a GP with a mean function μg (which we set
+to 0) and a covariance function denoted υ2Cg(χi,χj). One approach to obtaining
+derivatives would be to fit the GP to the data and differentiate the correlation func-
+tion. However, Holsclaw et al. (2013) outline how this approach can be inadequate
+due to loss of information when differentiating. They state that, if we fit the data
+process directly and then differentiate, we lose information about the derivative
+process, as, when observational error is present, the prediction of the derivative
+process is degraded [Stein (1999)]. Since our focus is directly on the rate process,
+g′(χi ) = w(χi ), we prefer to place a GP prior distribution on this and integrate to
+create estimates of the mean of the observed data, which we now denote h. 
+Writing h(χ) = χ w(u)du, we place a GP prior on w. The integration limits 0
+were simplified to start at 0 by readjusting x in the model setup. For our model
+we chose a GP with a mean function μw (which we set to 0) and a stationary
+powered-exponential covariance function, which we denote Cw(χi,χj). The ex-
+ponential covariance function is appropriate due to the underlying smooth nature
+of the sea-level data [abrupt changes in sea level are unlikely except in areas of in-
+stantaneous tectonic deformation such as those caused by megathrust earthquakes;
+e.g., Atwater (1987)]. We use a re-parameterized version so that Cw (χi , χj ) =
+ρ|χi −χj |κ with ρ ∈ (0, 1) and κ ∈ (0, 2]. The distribution of the observed data pro-
+cess h is available also as a GP, where the covariance function for h can be ob-
+tained by integrating the covariance function for the derivative process (w) twice. 
+The resulting covariance of the IGP is Kh(χi,χj) = χi χj Cw(u,v)dudv and 00
+h created from such a situation will be nonstationary, which will allow for the smoothness of the function to vary with repect to the input space, resulting in a more flexible model.
+A solution to the problematic double integration is provided by Holsclaw et al.
+(2013). They used an approach given in Yaglom (2011) to bypass the calculation
+of the double integral by approximating the integrated process on a grid x∗ =
+(x∗ · · · x∗ ) for arbitrarily large m. This yields 1m
+(4.3) h(χ)≈K∗ C∗∗−1wm, hw w
+
+where C∗∗ = [Cw(x∗,x∗)]m is an m × m matrix containing the covariance
+w i j i,j=1
+function for the derivative process and wm ∼ GP(μw,υ2C∗∗). Most usefully, ∗w
+Khw is the covariance between the rate process and the integrated process, and so only involves integrating the covariance once, that is, K ∗ (χi , x ∗ ) =
+hw j
+χi Cw(u,x∗)du. This integral is calculated numerically, using Chebyshev–Gauss
+
+The Holsclaw et al. (2013) approach replaces the integral estimate with the con- ditional mean of the integrated process given the derivative process, while ignoring any conditional variance. This approach is strongly related to that of the predictive processes [PP: Banerjee et al. (2008)]. In the PP approach, a spatial covariance matrix is approximated onto a smaller grid also by its conditional mean, resulting in smaller matrix manipulations for large spatial problems. However, a significant disadvantage of the PP is that the low rank approximation can yield poor estimates of the correlation structure. By contrast, our processes are one dimensional and we can set the grid size m large to arbitrarily reduce the approximation error with little computational cost. In that sense it has elements in common with high-rank approximations such as Lindgren, Rue and Lindström (2011).
+Last, we must account for GIA in our model for the proxy measurements. This introduces an extra fixed parameter γ (measured here in mm/yr) to account for land-level movements at an individual site. The GIA correction involves subtract- ing xi from the year of core collection, denoted t0. This is then multiplied by the rate of GIA γ and added to yi for each observation i. The introduction of the GIA parameter raises or lowers the sea level associated with each data point, and additionally introduces a correlation between the age and sea-level reconstruc- tions since older sea-level observations are raised/lowered to a greater degree. As an illustration, consider the single example from the North Carolina proxy reconstruction shown in Figure 2(A). The data point is given by the quadruple (yi,xi,σxi,σyi) with the density of this data point represented as contours, and samples shown for illustration. Once the GIA effect is removed, we obtain Fig- ure 2(B), where the left-hand side of the density has been raised to a greater degree than the right-hand side because it is older.
+Algebraically, the GIA effect can be removed via an affine transformation of
+0j
+quadrature [Abramowitz and Stegun (1965)].
+the data and the variance matrix by matrices A = corrected model is now
+
+1 0 and b = 0 −γ 1 γt0
+. The GIA-
+(4.4) Azi +b∼N μi,AViAT +τ2B , xχσx2000
+i=1,...,N,
+where zi = i , μi = i , Vi = i 2 and B = . Since Azi and
+yi α+h(χi) 0 σyi 0 1
+AViAT arebothdeterministicfunctionsofthedata,theycanbecalculatedoff-line prior to any analysis.
+The rate of GIA to be applied is spatially variable because of the underlying physical process [Engelhart et al. (2009)]. For our North Carolina case study,
+
+
+FIG. 2. Example of correcting a single data point in the North Carolina proxy sea-level reconstruc- tion for the effect of GIA. N=1000 data points were simulated from the bivariate distribution of the RSL reconstruction before (A) and after (B) it was corrected for GIA. Since GIA is a rate (in mm/yr), this correction results in bivariate correlated errors.
+where there are two sites, we apply the rates of 0.9 mm/yr and 1 mm/yr that were used in the original publication. Equation (4.4) forms the likelihood for the observed data based on the EIV-IGP model. This completes our model specifica- tion.
+All the models we outline were fitted in the JAGS (Just Another Gibbs Sampler) language [Plummer (2003)]. JAGS is a tool for analysis of Bayesian hierarchical models using Markov Chain Monte Carlo (MCMC) simulation. Although writing customized MCMC sampling algorithms can in some cases be relatively straight- forward, it has become more common practice to make use of Bayesian MCMC fitting software such as the Bayesian analysis Using Gibbs Sampling (BUGS) soft- ware. JAGS is an engine for running BUGS and allows users to write their own functions, distributions and samplers. JAGS offers cross-platform support and a direct interface to R using the package rjags [Plummer (2014)].
+We validated our model using two methods. First, we simulated data under ideal and nonideal conditions. The ideal scenario is one where the parameters are sim- ulated from the same distributions as the priors that are placed on the parame- ters. The nonideal scenarios lead to the prior distributions over/underestimating the mean and the variance of the parameters. The aim was to determine, for each scenario, the coverage probabilities for the true rate process within 95% and 68% credible intervals. Second, we performed a 10-fold cross-validation on our case study data. Results were highly satisfactory for both validation methods and we are confident that using this model for instrumental and proxy sea-level data al- lows us to estimate the underlying rates of sea-level change with a high degree of accuracy. Further details of how the validation was carried out along with results can be found in the Appendix. All code is available in the supplementary materials [Cahill et al. (2015)].
+5. Case studies. In this section we outline our prior distributions in further detail for each of our case studies. In the first case study we use tide-gauge mea-
+
+surements which have small age uncertainties and so are ignored, effectively re- moving the EIV structure and allowing us to demonstrate the IGP aspect of the model. Our second case study, the proxy data, contains all the elements outlined in this section. To illustrate the utility of the S-IGP and EIV-IGP models, we apply them to the global tide-gauge record since 1880 AD [Church and White (2011)] and a proxy RSL reconstruction spanning the last 2100 years [Kemp et al. (2011)]. The goal is to obtain the posterior distribution of sea level and of the rate process of interest.
+For both case studies we initially ran the appropriate model for 5000 iterations with a burn-in of 500 that we thinned by 3. In both cases we saw good convergence. We then ran the model for a long run of 50,000 iterations to ensure convergence remained and results were consistent. The R package coda [Plummer et al. (2006)] was used to run diagnostics. We used autocorrelation plots, Geweke plots [Geweke (1992)], the Gelman and Rubin diagnostic [Gelman and Rubin (1992)] and the Heidelberger and Welch diagnostic [Heidelberger and Welch (1983)], which all indicated model convergence. We also ran multiple chains from different starting values to ensure good mixing.
+5.1. Global tide-gauge record. A complete description of the approach and methods employed to generate this data set is presented in Church and White (2006, 2011). The data file includes 3 columns: time in years AD, GMSL in meters, and a one-sigma sea-level error in meters.
+The Simple Integrated Gaussian Process (S-IGP) model was used to analyze this data set. The distribution for the observed data is
+
+(5.2) h(x) ≈ K∗ C∗∗−1 wm, hw w
+(5.1) yi ∼N α+h(xi),σy2 +τ2 , i
+where h(x) is the approximation to the IGP described in Section 4. C∗∗ = |x∗−x∗|κ w
+isanm×mmatrixcontainingthecovariancefunctionforthederivative w hw x
+ρ i j
+process and wm ∼ GP(μw,υ2C∗∗). Recall, K∗ is the covariance between the rate
+process and the integrated process, that is, K∗ (xi,x∗) = i Cw(u,x∗)du. hw j 0 j
+Prior distributions were specified for each unknown parameter. The correlation parameter ρ was defined on the interval (0,1). The tide-gauge record [Church and White (2011)] spans a relatively short period of time, during which there was a single mode of climate warming and sea-level rise [Rahmstorf (2007)]. So even though this record is highly correlated, climate forcing, as opposed to time change, is the driver for sea-level change over this instrumental period. Therefore, we set a mildly informative prior for ρ that favors low values of the correlation parame- ter that are close to 0.2, where p(ρ) = Beta(2, 8). Another somewhat informative prior was used for τ2. To determine a prior for this parameter, we considered other global tide-gauge compilations such as Jevrejeva et al. (2008). The data supplied
+
+for this record have associated standard errors for each sea-level measurement. Details of how these errors are determined can be found in Jevrejeva et al. (2006). These standard errors range from 0.01–0.07 m. In choosing our prior we used this information, but we do not restrict τ to be within this range, instead we chose to conservatively place a prior on τ2 that favors values for τ close to 0.1 m, where τ 2 ∼ Gamma(0.1, 10).
+We decided on a prior for υ2, the variance of the rate process, by looking at the information currently available regarding the rate of global sea-level rise. Be- tween 1950 AD and 2000 AD trends in global average rates of sea-level rise varied from 0 to 4 mm/yr [White, Church and Gregory (2005)]. Over multi-centennial timescales during the last 2000 years (prior to industrialization), global sea level was likely close to stable after correction for land-level movements (i.e., rate ∼0 mm/yr). Alternatively, at decadal to multi-decadal time scales, higher regional rates (up to 4 mm/yr) are observed in instrumental records after correction for land-level movements. A GP prior centered on 0 was used to describe the rate process for our model. The prior information suggests that rates can reach up to 4 mm/yr. Therefore, we deemed the range of the rate of sea level, −4 to 4 mm/yr, appropriate. If this range is treated as a 95% confidence interval, it is reasonable to assume that the standard deviation is ∼ 2 mm/yr. Hence, we set up the prior for υ2 to favor values close to 4, where υ2 ∼ Gamma(80, 20). An uninformative normal prior is placed on the unknown intercept parameter α.
+The analysis of the global tide-gauge record is presented in Figure 3, which shows the GMSL predictions estimated from our model (A) and our rate esti- mates (B). The rate of GMSL rise estimated from a linear regression analysis of the global tide-gauge record for the entire period 1880 AD to 2009 AD was 1.5 mm/yr [Church and White (2006)]. This is consistent with the average rate suggested in Figure 3(B). The rate of sea-level rise from 1900 AD to 2009 AD was 1.7 mm/yr ± 0.3 mm [Church and White (2006)]. The S-IGP model indicates that this rate occurred from approximately 1965 AD to 1975 AD. Furthermore, the model indicates that the rate of GMSL rise actually increased (accelerated) con- stantly through time from 1.13 mm/yr in 1880 AD to 1.92 mm/yr in 2009 AD [Figure 3(B)]. The recognition of accelerating sea-level rise agrees with projec- tions for the 21st century that can only be realized with continued acceleration [IPCC (2013)]. We demonstrate that the S-IGP model negates the need to analyze specific intervals of temporal data and consequently provides more accurate and representative estimates of the constantly evolving rate of sea-level change.
+5.2. North Carolina proxy reconstruction. The example data set from North
+Carolina is a proxy reconstruction spanning the last ∼2100 years that was de-
+veloped from cores of salt-marsh sediment located at two sites (Tump Point,
+◦ ′ ′′ ◦ ′ ′′ ◦ ′ ′′ ◦ ′ ′′
+34 5812 N 76 2248 W; and Sand Point, 35 5305 N 75 4051 W) that are 120 km apart [Kemp et al. (2011)]. As such, it provides a regional record of
+
+                                                                   FIG. 3. (A) Predictions for GMSL since 1880 AD generated by fitting the S-IGP model to the instrumental data set. Shading denotes 68% and 95% credible intervals for the posterior mean fit. (B) Rate of global sea-level rise calculated as the derivative of the fitted model. Shading denotes 68% and 95% credible intervals for the posterior mean of the rate process.
+RSL change for North Carolina. The correction for GIA was estimated from a re- gional database of late Holocene relative sea-level reconstructions [Engelhart et al. (2009)]. The rate of GIA is 0.9 mm/yr at Tump Point and 1.0 mm/yr at Sand Point. The data file includes 4 columns: RSL in meters, age in year AD, a one-sigma RSL error, and a two-sigma age error.
+The EIV-IGP model, described in detail in Section 4, was used to analyze this data set. Prior distributions were specified for each unknown parameter. As with the S-IGP model, the correlation parameter ρ is defined on the interval (0, 1). The chosen prior p(ρ) = Beta(2, 8), which suggests a mean of approximately 0.2 with a standard deviation of approximately 0.1. This assumes that data points more than 1000 years apart have minimal effect on one another. This is a reasonable as- sumption given that the reconstruction spans a 2100 year time period and includes multiple phases of sea level and climate behavior, including the warmer Medieval Climate Anomaly, cooler Little Ice Age, and very warm 20th and 21st centuries
+
+                                                                                  FIG. 4. (A) Predictions for North Carolina sea level generated by fitting the EIV-IGP model. Shad- ing denotes 68% and 95% credible intervals for the posterior mean fit. (B) Rate of sea-level change in North Carolina calculated as the derivative of the fitted model. Shading denotes 68% and 95% credible intervals for the posterior mean of the rate process.
+[Mann et al. (2008)]. We used the same prior for the variance parameter τ 2 as for the previous case study. Following the same reasoning as with the tide-gauge data in Section 5.1, a gamma prior, υ 2 ∼ Gamma(80, 20), was used for the variance of the derivative process. An uninformative normal prior was placed on the unknown intercept parameter α.
+Application of the EIV-IGP model to the proxy sea-level reconstruction from North Carolina shows four persistent phases of sea-level behavior [Figure 4(A)]. The model predictions are a good fit to the proxy reconstructed data which gives confidence in the model. From the start of the record at approximately 100 BC to 1000 AD there is little change in sea level following correction for GIA. The period from 1000 AD to 1400 AD is characterized by sea-level rise. Between 1400 AD and about 1850 AD there was a fall in sea level and since 1850 AD sea level rose rapidly in North Carolina. This evolution in sea level is reflected in the modeled rate of sea-level rise [Figure 4(B)], where the first period has a mean sea-level change of approximately 0 mm/yr. The second period saw a maximum rate of rise reach a posterior mean value of 0.53 mm/yr with a 95% credible interval for this mean of 0.39 to 0.68 mm/yr, which Kemp et al. (2011) attributed to a
+
+warmer climate during the Medieval Climate Anomaly. The sea-level fall between 1400 AD and 1850 AD occurred at a maximum rate of 0.3 mm/yr with a 95% credible interval for this mean of 0.16 to 0.43 mm/yr and was likely a sea-level response to the cooler Little Ice Age [Kemp et al. (2011)]. The transition from the Little Ice Age is marked by a dramatic increase in the rate of sea-level rise that continues to a mean rate of 2.44 mm/yr in 2000 AD with a 95% credible interval of 1.91 to 3.01 mm/yr. The rate of sea-level rise since the middle of the 19th century is without precedent in North Carolina for at least the previous 2000 years. The modeled mean rate of rise departs from earlier 95% credible intervals at around 1845 AD.
+6. Conclusion. Taking into account all sources of uncertainty (temporal and vertical) when estimating sea-level trends is essential to allow instrumental mea- surements and proxy reconstructions of sea level to be compared directly and fairly. Previous analysis incorrectly ignored some or all of the uncertainties. We proposed and validated a model that allows for the direct estimation of rates of sea-level change while quantifying uncertainties more thoroughly than previously possible. The method involves a nonparametric reconstruction of the derivative process. A GP prior is placed on the derivative process and we view the mean of the distribution assumed for the observed data to be the integral of this process. For our case study data, the derivative at a particular time point is representative of the rate of sea-level change at that time point. This enables us to estimate instanta- neous rates of change and observe the constant evolution of dynamic sea-level rise through time. The model also provides a flexible fit and allows us to estimate the uncertainty about the rate process of interest.
+Our analysis of the global tide-gauge record shows that the rate of GMSL rise increased (accelerated) continuously from 1.13 mm/yr in 1880 AD to 1.92 mm/yr in 2009 AD. Application of our model to an example proxy sea-level reconstruc- tion from North Carolina quantified the changing rate of sea-level rise through the Medieval Climate Anomaly, Little Ice Age and 20th century. The posterior mean rate of rise in North Carolina at 2000 AD was 2.44 mm/yr with a 95% credible interval of 1.91 to 3.01 mm/yr. This is the fastest rate of rise in the 2000-year long reconstruction.
+APPENDIX: MODEL VALIDATION
+A.1. Simulated scenarios. In this section we demonstrate the validity of our model. Through the use of simulated data, parameters α and τ2 (see Section 4), proved to be robust. Within reason, there was no difficulty in estimating the val- ues of these parameters, regardless of prior choice. We found the parameters that related to the GP, that is, σg2 and ρ, were the more sensitive parameters in the model and, as a result, the validation focused on these. For the purposes of this validation we used a simpler model, that is, the version that is not set in the EIV
+
+framework. The parameters that were introduced in cases where an errors-in vari- ables approach was necessary were all estimated directly from the data and, thus, we excluded this component of the model in the validation process in order to simplify things. Therefore, the data was simulated from the following distribu- tion:
+
+(A.1) yi ∼N α+h(xi),τ2 , i=1,...,N, (A.2) h(xi) ≈ K∗ C∗∗−1wm,
+hw w
+whereC∗∗ =[Cw(x∗,x∗)]m isanm×mmatrixcontainingthecovariancefunc-
+w i j i,j=1
+tion for the derivative process and wm ∼ GP(μw,υ2C∗∗). K∗ is the covariance
+between the rate process and the integrated process.
+To validate the model, we considered several different scenarios under ideal
+and nonideal conditions. For each scenario we simulated values for the unknown parameters, which in turn were used to simulate data from an integrated GP model. Data simulation required simulation of the underlying rate process, which, based on our model assumptions, is a GP. Therefore, we knew the true under- lying rate process. As the focus of this work is in establishing rates of sea-level change, our primary concern was whether or not our model was successful in es- timating the true underlying rate process. We observed how often the true rate falls within the 95% and 68% credible intervals for the rate predicted from the model.
+For the purposes of this validation, the priors that were placed on the parame- ters σg2 and ρ were σg2 ∼ gamma(10, 10) and ρ ∼ beta(2, 8). Therefore, σg2 will be centered around 1 with a variance of 0.1 and ρ will be centered around 0.2 with a variance of 0.01. In scenario (a) the parameter values came from the same distributions as our priors. This was the ideal case and we expected the model to perform best under these conditions. In scenarios (b) and (c) we simulated the parameters so that our prior assumptions were underestimating/overestimating the means, respectively. In scenarios (d) and (e) we simulated parameter values so that our prior assumptions were underestimating/overestimating the variances, respectively. Finally, for scenarios (f) and (g) we simulated parameter values so that our prior assumptions were underestimating/overestimating both the mean and variances. 500 simulations were run for each scenario. The 95% and 68% coverage probabilities were observed. An average over the 500 simulations was taken for our validation results. The results of this validation are shown in Ta- ble 1.
+The model was capable of estimating the rate process, even if the prior distribu- tions for the parameters were over/underestimating means and variances. For the ideal scenario the true rate fell within the 95% credible interval and 68% credi- ble interval of the estimated rate approximately 95% and 68% of the time as ex- pected. For scenarios (b) and (e) the rate fell into the credible intervals a higher proportion of the time. This suggests that underestimating the mean values of our
+w hw
+
